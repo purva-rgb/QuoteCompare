@@ -218,3 +218,31 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Local data and quotation documents
+data/
+uploads/
+*.pdf
+
+# Generated outputs
+outputs/
+*.csv
+*.json
+
+# Editors and operating-system files
+.vscode/
+.DS_Store
+Thumbs.db

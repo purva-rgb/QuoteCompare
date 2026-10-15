@@ -1,4 +1,6 @@
 streamlit>=1.40
 pypdf>=5.0
 pandas>=2.2
-requests>=2.32
+requests>=2.32,<3
+pydantic>=2.10,<3
+pytest>=8,<10
