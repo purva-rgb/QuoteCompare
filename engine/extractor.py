@@ -45,9 +45,8 @@ OLLAMA_URL = os.getenv(
     "OLLAMA_URL", "http://127.0.0.1:11434"
 ).rstrip("/")
 
-# qwen2.5:3b was about 5x faster than qwen2.5:7b on a CPU-only machine.
-# Set the OLLAMA_MODEL environment variable to switch models.
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+# Default local model. Set the OLLAMA_MODEL environment variable to switch.
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
 
 # Seconds to wait without ANY output from the model (model loading plus
 # reading the page happen before the first output). Because responses are
