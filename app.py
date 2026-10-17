@@ -7,6 +7,7 @@ import json
 import logging
 import time
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Callable
 
 import streamlit as st
@@ -25,6 +26,12 @@ from engine.pipeline import (
     QuotationProcessingError,
     process_quotation_text,
 )
+from engine.ratings import (
+    RatingInputError,
+    SupplierRef,
+    supplier_key,
+    validate_supplier_rating,
+)
 from engine.text_quality import diagnose_page, font_currency_hints
 from engine.recommender import (
     STATUS_EFFECTIVELY_TIED,
@@ -37,7 +44,11 @@ from engine.recommender import (
 from engine.schemas import Quotation
 from engine.scoring import (
     CRITERIA,
+    DEFAULT_PRICE_WEIGHT_PERCENT,
+    ComparisonInput,
     ScoreInput,
+    is_critical_issue,
+    rank_comparisons,
     score_suppliers,
     validate_rating,
     winner_ranges,
@@ -70,6 +81,7 @@ RESULTS_KEY = "quotecompare_results"
 SIGNATURE_KEY = "quotecompare_signature"
 PAGE_CACHE_KEY = "quotecompare_page_cache"
 RATINGS_KEY = "quotecompare_ratings"  # kept when cached results are cleared
+SUPPLIER_RATINGS_KEY = "quotecompare_supplier_ratings"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -439,8 +451,11 @@ def process_one_file(
 # Export helpers
 # ---------------------------------------------------------
 
-def build_export(results: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
+def build_export(
+    results: list[dict[str, Any]],
+    supplier_ratings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "model": OLLAMA_MODEL,
         "files": [
@@ -455,6 +470,9 @@ def build_export(results: list[dict[str, Any]]) -> dict[str, Any]:
             for r in results
         ],
     }
+    if supplier_ratings:
+        payload["supplier_ratings"] = supplier_ratings
+    return payload
 
 
 def build_line_items_csv(results: list[dict[str, Any]]) -> str:
@@ -1205,101 +1223,360 @@ def render_quotation(data: dict[str, Any], key_prefix: str, filename: str,
     )
 
 
-def render_results(results: list[dict[str, Any]]) -> None:
-    st.divider()
-    st.header("Results")
+def _supplier_refs(results: list[dict[str, Any]]) -> list[SupplierRef]:
+    """One record per extracted quotation, not per supplier name."""
+    refs: list[SupplierRef] = []
+    for result in results:
+        file_hash = str(result.get("file_hash") or "").strip()
+        if not file_hash:
+            continue
+        for occurrence, entry in enumerate(result.get("quotations") or []):
+            data = entry.get("data") if isinstance(entry, dict) else None
+            vendor = data.get("vendor") if isinstance(data, dict) else None
+            if not isinstance(vendor, dict):
+                vendor = {}
+            page = entry.get("page") if isinstance(entry, dict) else None
+            refs.append(SupplierRef(
+                file_hash=file_hash,
+                filename=str(result.get("filename") or ""),
+                page=page if isinstance(page, int) else None,
+                quotation_number=vendor.get("quotation_number"),
+                supplier_name=vendor.get("name"),
+                occurrence=occurrence,
+            ))
+    return refs
 
-    all_quotations = [q for r in results for q in r.get("quotations", [])]
-    page_error_count = sum(len(r.get("page_errors", [])) for r in results)
-    with_issues = sum(
-        1 for q in all_quotations
-        if get_issues(validation_dict(q["data"]))
-        or validation_dict(q["data"]).get("status") not in (None, "valid")
+
+def _saved_rating(store: dict[str, Any], key: str) -> dict[str, Any]:
+    saved = store.get(key)
+    return saved if isinstance(saved, dict) else {}
+
+
+def _optional_number(value: Any) -> int | float | None:
+    if value is None or value == "":
+        return None
+    return value
+
+
+def render_supplier_ratings(results: list[dict[str, Any]]) -> None:
+    """Enter a public rating and review count. Does not score suppliers."""
+    refs = _supplier_refs(results)
+    if not refs:
+        return
+
+    st.subheader("Supplier ratings")
+    st.caption(
+        "Type a public rating and a review count for each quotation. "
+        "A blank field stays blank and is not stored as zero. The public "
+        "rating is the quality input. The review count is shown beside "
+        "it and is not added into the score."
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Files", len(results))
-    c2.metric("Quotations extracted", len(all_quotations))
-    c3.metric("Pages that failed", page_error_count)
-    c4.metric("With validation issues", with_issues)
+    store: dict[str, Any] = st.session_state.setdefault(
+        SUPPLIER_RATINGS_KEY, {}
+    )
 
-    for file_index, result in enumerate(results):
-        has_problem = (
-            not result["success"] or bool(result.get("page_errors"))
-        )
-        icon = "⚠️ " if has_problem else "✅ "
-        elapsed = result.get("elapsed_seconds")
-        title = result["filename"] + (
-            f" ({elapsed}s)" if elapsed is not None else ""
+    for ref in refs:
+        key = supplier_key(ref)
+        saved = _saved_rating(store, key)
+        where = (
+            f"Page {ref.page}" if ref.page is not None else "Whole PDF"
         )
 
-        with st.expander(icon + title, expanded=has_problem):
-            if not result["success"]:
-                st.error(result.get("error", "Processing failed."))
+        with st.form(f"supplier_rating_{key}"):
+            st.markdown(f"**{ref.supplier_name or 'Unnamed supplier'}**")
+            st.caption(
+                f"{ref.filename} · {where} · "
+                f"Quotation no.: {ref.quotation_number or 'Unknown'}"
+            )
+            public_col, count_col = st.columns(2)
+            public_rating = public_col.number_input(
+                "Public rating (1–5)",
+                min_value=1.0,
+                max_value=5.0,
+                value=_optional_number(saved.get("public_rating")),
+                step=0.1,
+                format="%.1f",
+                key=f"public_{key}",
+            )
+            review_count = count_col.number_input(
+                "Review count",
+                min_value=0,
+                value=_optional_number(saved.get("review_count")),
+                step=1,
+                key=f"reviews_{key}",
+            )
+            submitted = st.form_submit_button("Save ratings")
 
-            pdf_info = result.get("pdf_result")
-            if pdf_info:
-                st.caption(
-                    f"Pages: {pdf_info['page_count']} · "
-                    f"Pages with text: {pdf_info['pages_with_text']}"
+        if saved:
+            public = saved.get("public_rating")
+            reviews = saved.get("review_count")
+            st.caption(
+                "Saved. Public rating: "
+                f"{'Not entered' if public is None else public}. "
+                "Review count: "
+                f"{'Not entered' if reviews is None else reviews}."
+            )
+
+        if not submitted:
+            continue
+
+        try:
+            record = validate_supplier_rating(
+                ref,
+                public_rating=public_rating,
+                review_count=review_count,
+            )
+        except RatingInputError as exc:
+            for message in exc.errors:
+                st.error(message)
+            continue
+
+        store[key] = record.to_dict()
+        st.success(
+            "Saved ratings for "
+            f"{ref.supplier_name or 'this quotation'}."
+        )
+
+
+def _supplier_label(
+    name: str,
+    number: Any,
+    page: Any,
+    filename: Any,
+) -> str:
+    if number:
+        return f"{name} ({number})"
+    if isinstance(page, int):
+        return f"{name} (page {page})"
+    if filename:
+        return f"{name} ({filename})"
+    return name
+
+
+def _money_cell(total: Decimal | None, currency: str | None) -> str:
+    if total is None:
+        return "Not provided"
+    prefix = f"{currency} " if currency else ""
+    return f"{prefix}{total:,.2f}"
+
+
+def _score_cell(value: float | None) -> str:
+    if value is None:
+        return "Unavailable"
+    return f"{value:.1f}"
+
+
+def _rating_cell(value: float | None) -> str:
+    if value is None:
+        return "Not provided"
+    return f"{value:.1f}"
+
+
+def _count_cell(value: int | None) -> str:
+    if value is None:
+        return "Not provided"
+    return str(value)
+
+
+def _comparison_inputs(results: list[dict[str, Any]]) -> list[ComparisonInput]:
+    """Pair each extracted quotation with the rating saved for its key."""
+    store = st.session_state.get(SUPPLIER_RATINGS_KEY, {})
+    built: list[ComparisonInput] = []
+
+    for result in results:
+        file_hash = str(result.get("file_hash") or "").strip()
+        if not file_hash:
+            continue
+        for occurrence, entry in enumerate(result.get("quotations") or []):
+            if not isinstance(entry, dict):
+                continue
+            data = entry.get("data")
+            vendor = data.get("vendor") if isinstance(data, dict) else None
+            if not isinstance(vendor, dict):
+                vendor = {}
+            page = entry.get("page")
+            ref = SupplierRef(
+                file_hash=file_hash,
+                filename=str(result.get("filename") or ""),
+                page=page if isinstance(page, int) else None,
+                quotation_number=vendor.get("quotation_number"),
+                supplier_name=vendor.get("name"),
+                occurrence=occurrence,
+            )
+            key = supplier_key(ref)
+            saved = store.get(key) if isinstance(store.get(key), dict) else {}
+            name = vendor.get("name") or "Unnamed supplier"
+            number = vendor.get("quotation_number")
+            label = _supplier_label(name, number, page, result.get("filename"))
+
+            try:
+                quotation = Quotation.model_validate(data)
+            except Exception:
+                built.append(ComparisonInput(
+                    label=label,
+                    supplier_key=key,
+                    grand_total=None,
+                    currency=None,
+                    eligible=False,
+                    public_rating=saved.get("public_rating"),
+                    review_count=saved.get("review_count"),
+                    warnings=("This quotation could not be compared.",),
+                    critical=True,
+                ))
+                continue
+
+            issues = list(quotation.validation.issues)
+            warnings = [issue for issue in issues if is_critical_issue(issue)]
+            grand = quotation.totals.grand_total
+            subtotal = quotation.totals.subtotal
+            tax_total = quotation.totals.tax_total
+            reasons: list[str] = []
+            if quotation.validation.status == "invalid":
+                reasons.append("Validation status is invalid.")
+            if grand is None:
+                reasons.append("No quotation total was extracted.")
+            elif grand <= 0:
+                reasons.append("The quotation total is zero.")
+            elif (
+                subtotal is not None
+                and tax_total is not None
+                and abs((subtotal + tax_total) - grand) > Decimal("0.02")
+            ):
+                reasons.append(
+                    "The stated subtotal plus tax does not equal the "
+                    "quotation total."
+                )
+            for reason in reasons:
+                if reason not in warnings:
+                    warnings.append(reason)
+            if quotation.vendor.name:
+                name = quotation.vendor.name
+                number = quotation.vendor.quotation_number
+                label = _supplier_label(
+                    name, number, page, result.get("filename")
                 )
 
-            for err in result.get("page_errors", []):
-                where = (
-                    f"Page {err['page']}" if err["page"] is not None
-                    else "Whole PDF"
-                )
-                st.error(f"{where}: {err['error']}")
+            built.append(ComparisonInput(
+                label=label,
+                supplier_key=key,
+                grand_total=grand,
+                currency=quotation.vendor.currency,
+                eligible=not reasons,
+                public_rating=saved.get("public_rating"),
+                review_count=saved.get("review_count"),
+                warnings=tuple(warnings),
+                critical=bool(warnings) or quotation.validation.status == "invalid",
+            ))
+    return built
 
-            for skipped in result.get("skipped_pages", []):
-                st.info(f"Page {skipped['page']} skipped: {skipped['reason']}.")
 
-            for q_index, entry in enumerate(result.get("quotations", [])):
-                label = (
-                    f"Page {entry['page']}" if entry["page"] is not None
-                    else "Whole PDF"
-                )
-                vendor = entry["data"].get("vendor")
-                name = vendor.get("name") if isinstance(vendor, dict) else None
+def _render_best_pick(ranking) -> None:
+    best = ranking.best
+    st.subheader("Best Pick")
+    if best.pending:
+        st.info(f"{best.headline}. {best.explanation}")
+        return
 
-                with st.container(border=True):
-                    st.subheader(f"{label}" + (f" · {name}" if name else ""))
+    st.success(best.headline)
+    total = _money_cell(best.grand_total, best.currency)
+    rating = _rating_cell(best.public_rating)
+    reviews = _count_cell(best.review_count)
+    score = _score_cell(best.combined_score)
+    st.write(
+        f"**Combined score:** {score} · **Quotation total:** {total} · "
+        f"**Public rating:** {rating} · **Review count:** {reviews}"
+    )
+    st.write(best.explanation)
+    if best.warnings:
+        st.warning(" ".join(best.warnings))
+    others = [
+        f"{row.label}: {row.warnings[0]}"
+        for row in ranking.rows
+        if row.critical and row.warnings
+        and row.supplier_key != best.supplier_key
+    ]
+    if others:
+        st.warning("Critical review items: " + "; ".join(others))
 
-                    diagnostic = entry.get("text_diagnostics") or {}
-                    unreadable = int(diagnostic.get("unreadable_chars") or 0)
-                    if unreadable:
-                        st.warning(
-                            diagnostic.get("message")
-                            or (
-                                f"This page contains {unreadable} unreadable "
-                                "character(s). The original text was kept. "
-                                "Verify amounts and currency against the PDF."
-                            )
-                        )
 
-                    source_text = entry.get("source_text")
-                    if source_text:
-                        with st.expander("Original extracted text"):
-                            st.text(source_text)
-                            st.caption(
-                                "This is the text taken from the PDF. "
-                                "Unreadable characters were not replaced."
-                            )
+def _render_comparison_table(results: list[dict[str, Any]]) -> None:
+    inputs = _comparison_inputs(results)
+    if not inputs:
+        st.info("No suppliers were extracted to compare.")
+        return
 
-                    render_quotation(
-                        entry["data"],
-                        key_prefix=f"{file_index}_{q_index}",
-                        filename=result["filename"],
-                        page=entry["page"],
-                    )
+    price_weight = st.slider(
+        "Price weight",
+        min_value=0,
+        max_value=100,
+        value=DEFAULT_PRICE_WEIGHT_PERCENT,
+        step=5,
+        format="%d%%",
+        key="comparison_price_weight",
+        help="Quality receives the remaining share, so the weights sum to 100%.",
+    )
+    st.caption(f"Price {price_weight}% · Quality {100 - price_weight}%")
 
-    if all_quotations:
-        st.subheader("Export")
+    ranking = rank_comparisons(inputs, price_weight)
+    st.subheader("Supplier comparison")
+    if ranking.price_only_reason:
+        st.caption(ranking.price_only_reason)
+
+    show_table([
+        {
+            "Rank": (
+                str(item.rank) if item.rank is not None else "Unavailable"
+            ),
+            "Supplier": item.label,
+            "Quotation total": _money_cell(item.grand_total, item.currency),
+            "Public rating": _rating_cell(item.public_rating),
+            "Review count": _count_cell(item.review_count),
+            "Price score": _score_cell(item.price_score),
+            "Quality score": _score_cell(item.quality_score),
+            "Combined score": _score_cell(item.combined_score),
+            "Status": item.status,
+        }
+        for item in ranking.rows
+    ])
+    _render_best_pick(ranking)
+
+
+def render_results(results: list[dict[str, Any]]) -> None:
+    st.divider()
+
+    for result in results:
+        if result.get("success"):
+            continue
+        st.warning(
+            f"{result.get('filename', 'A file')}: "
+            f"{result.get('error', 'This file could not be processed.')}"
+        )
+
+    all_quotations = [q for r in results for q in r.get("quotations", [])]
+    if not all_quotations:
+        st.info("No quotations were extracted.")
+        return
+
+    render_supplier_ratings(results)
+    _render_comparison_table(results)
+
+    saved_ratings = [
+        value
+        for value in st.session_state.get(SUPPLIER_RATINGS_KEY, {}).values()
+        if isinstance(value, dict)
+        and value.get("supplier_key") in {
+            supplier_key(ref) for ref in _supplier_refs(results)
+        }
+    ]
+    with st.expander("Download results"):
         e1, e2 = st.columns(2)
         e1.download_button(
             "Download all results (JSON)",
             data=json.dumps(
-                build_export(results), ensure_ascii=False, indent=2
+                build_export(results, saved_ratings),
+                ensure_ascii=False,
+                indent=2,
             ).encode("utf-8"),
             file_name="quotecompare_results.json",
             mime="application/json",
@@ -1313,8 +1590,6 @@ def render_results(results: list[dict[str, Any]]) -> None:
             key="download_all_csv",
         )
 
-    if len(all_quotations) >= 2:
-        render_comparison(results)
 
 
 # ---------------------------------------------------------
@@ -1350,20 +1625,12 @@ with st.sidebar:
         "whole-PDF mode instead."
     )
 
-    st.write("**Processing:** Local Python + Ollama")
     st.write(f"**Model:** {OLLAMA_MODEL}")
-    st.write(f"**Ollama URL:** {OLLAMA_URL}")
-
-    st.write(f"**Ollama timeout:** {OLLAMA_TIMEOUT} s")
     if OLLAMA_TIMEOUT < MIN_RECOMMENDED_TIMEOUT:
         st.warning(
-            f"OLLAMA_TIMEOUT is {OLLAMA_TIMEOUT} s, which is short for a "
-            "7B model. Set the OLLAMA_TIMEOUT environment variable to 600 "
-            "or higher."
+            f"The local model timeout is {OLLAMA_TIMEOUT} seconds, which "
+            "is short for this model."
         )
-    st.write(f"**Maximum file size:** {MAX_FILE_SIZE_MB} MB")
-    st.write(f"**Maximum pages per PDF:** {MAX_PAGES}")
-    st.write(f"**Maximum files per batch:** {MAX_FILES}")
 
     ollama_ok, ollama_message = check_ollama()
     if ollama_ok:
@@ -1403,9 +1670,9 @@ if not uploaded_files:
         ### Get started
 
         1. Upload your supplier quotation PDFs.
-        2. Review the extracted text.
-        3. Run local AI processing.
-        4. Check validation warnings and download the results.
+        2. Process them on this computer.
+        3. Enter a public rating and review count for each supplier.
+        4. Read the comparison table and the Best Pick.
         """
     )
     st.stop()
@@ -1438,9 +1705,7 @@ st.subheader("Uploaded quotations")
 for index, record in enumerate(uploaded_records):
     size_mb = len(record["bytes"]) / (1024 * 1024)
 
-    with st.expander(f"📄 {record['filename']} — {size_mb:.2f} MB"):
-        st.write(f"SHA-256: `{record['hash']}`")
-
+    with st.expander(f"{record['filename']} — {size_mb:.2f} MB"):
         if size_mb > MAX_FILE_SIZE_MB:
             st.error(f"This file exceeds the {MAX_FILE_SIZE_MB} MB limit.")
             continue
@@ -1451,28 +1716,15 @@ for index, record in enumerate(uploaded_records):
             st.error(f"Cannot preview this PDF: {exc}")
             continue
 
-        st.write(
-            f"Pages: {preview['page_count']} · "
-            f"Pages with text: {preview['pages_with_text']}"
-        )
-
         affected = [
             d["page"] for d in preview["page_diagnostics"]
             if d.get("unreadable_chars")
         ]
         if affected:
-            details = []
-            for diagnostic in preview["page_diagnostics"]:
-                if diagnostic.get("unreadable_chars"):
-                    details.append(
-                        diagnostic.get("message")
-                        or f"Page {diagnostic['page']} has unreadable characters."
-                    )
             st.warning(
                 "Unreadable characters were found on page(s) "
-                f"{', '.join(map(str, affected))}. The original text is "
-                "kept. A box is not replaced with a currency symbol.\n\n"
-                + "\n\n".join(details)
+                f"{', '.join(map(str, affected))}. Amounts from those "
+                "pages need review before a Best Pick."
             )
 
         if preview["pages_with_text"] == 0:
@@ -1480,26 +1732,6 @@ for index, record in enumerate(uploaded_records):
                 "No usable text was found. This PDF may be image-only. "
                 "OCR was not run."
             )
-            continue
-
-        if mode == MODE_PER_PAGE:
-            st.caption(
-                f"{preview['pages_with_text']} page(s) will be sent to the "
-                "model as separate quotations."
-            )
-
-        st.text_area(
-            "Original extracted text",
-            preview["text"],
-            height=220,
-            key=f"preview_{index}_{record['hash']}",
-        )
-        st.caption(
-            "Original text from the PDF, shown beside any currency "
-            "evidence in the page diagnostics. The text is not rewritten."
-        )
-        st.caption("Page extraction diagnostics")
-        show_table(preview["page_diagnostics"])
 
 
 # ---------------------------------------------------------
@@ -1536,19 +1768,7 @@ if st.button("🚀 Process quotations locally", type="primary"):
     def live_hook(info: dict[str, Any]) -> None:
         elapsed = int(info["elapsed"])
 
-        if info["phase"] == "waiting":
-            live.info(
-                "Sent to the model. Waiting for the first output. Loading "
-                "the model and reading the page can take a minute or two, "
-                "especially on a CPU."
-            )
-            return
-
-        rate = info["tokens"] / info["elapsed"] if info["elapsed"] > 0 else 0
-        live.info(
-            f"Model is generating: about {info['tokens']} tokens · "
-            f"{elapsed}s elapsed · {rate:.1f} tokens/s"
-        )
+        live.info(f"Processing quotations… {elapsed}s")
 
     set_progress_hook(live_hook)
 
@@ -1558,7 +1778,7 @@ if st.button("🚀 Process quotations locally", type="primary"):
             def report(
                 message: str, fraction: float, _i: int = index
             ) -> None:
-                status.write(f"File {_i + 1} of {total_files} — {message}")
+                status.write(f"File {_i + 1} of {total_files}")
                 progress.progress(min((_i + fraction) / total_files, 1.0))
 
             results.append(
