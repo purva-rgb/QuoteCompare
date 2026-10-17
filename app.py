@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import io
@@ -8,6 +9,8 @@ import logging
 import time
 from datetime import datetime
 from decimal import Decimal
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable
 
 import streamlit as st
@@ -47,6 +50,7 @@ from engine.scoring import (
     DEFAULT_PRICE_WEIGHT_PERCENT,
     ComparisonInput,
     ScoreInput,
+    is_advisory_extraction_warning,
     is_critical_issue,
     rank_comparisons,
     score_suppliers,
@@ -90,7 +94,7 @@ st.set_page_config(
     page_title=APP_NAME,
     page_icon="📄",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 
@@ -100,6 +104,128 @@ st.set_page_config(
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def _background_data_uri() -> str | None:
+    """Local photograph, if the project has one. Never fetched at runtime."""
+    root = Path(__file__).resolve().parent / "assets"
+    for name in (
+        "quotecompare_background.jpg",
+        "quotecompare_background.jpeg",
+        "quotecompare_background.png",
+    ):
+        path = root / name
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if not data:
+            continue
+        mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        encoded = base64.b64encode(data).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+    return None
+
+
+def _apply_theme(hero: bool) -> None:
+    """Dark event photograph for the opening screen. A light page for results."""
+    image = _background_data_uri() if hero else None
+    if hero and image:
+        background = (
+            "linear-gradient(180deg, rgba(8, 14, 26, 0.58) 0%, "
+            "rgba(8, 14, 26, 0.82) 100%), "
+            f"url('{image}') center / cover no-repeat fixed"
+        )
+    elif hero:
+        background = (
+            "radial-gradient(900px 420px at 12% 0%, "
+            "rgba(198, 161, 91, 0.22), transparent 60%), "
+            "linear-gradient(165deg, #0b1220 0%, #17263d 52%, #0d1728 100%)"
+        )
+    else:
+        background = "#f4f6f8"
+
+    hero_text = """
+    [data-testid="stSidebar"] {
+        background: rgba(9, 14, 24, 0.94);
+    }
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] span,
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3 {
+        color: #e7edf6;
+    }
+    .qc-brand {
+        letter-spacing: 0.28em;
+        color: #c6a15b;
+        font-size: 0.82rem;
+        font-weight: 650;
+        margin-bottom: 0.35rem;
+    }
+    .qc-headline {
+        color: #f8f5ef;
+        font-size: clamp(2rem, 4vw, 3.4rem);
+        line-height: 1.12;
+        font-weight: 650;
+        margin: 0 0 0.6rem 0;
+        max-width: 14em;
+    }
+    .qc-lead {
+        color: rgba(247, 244, 238, 0.88);
+        font-size: 1.05rem;
+        max-width: 38rem;
+        margin-bottom: 1.25rem;
+    }
+    .st-key-hero_panel {
+        background: rgba(12, 20, 34, 0.58);
+        border: 1px solid rgba(198, 161, 91, 0.42);
+        border-radius: 18px;
+        padding: 1.25rem 1.35rem 0.85rem;
+        box-shadow: 0 20px 48px rgba(0, 0, 0, 0.28);
+        backdrop-filter: blur(16px);
+    }
+    .st-key-hero_panel p,
+    .st-key-hero_panel label,
+    .st-key-hero_panel span {
+        color: #f4efe6;
+    }
+    """ if hero else """
+    .st-key-best_pick {
+        background: #ffffff;
+        border: 1px solid #d9e0ea;
+        border-top: 4px solid #c6a15b;
+        border-radius: 14px;
+        padding: 0.35rem 0.85rem 0.15rem;
+    }
+    """
+
+    st.markdown(
+        f"""
+        <style>
+        [data-testid="stAppViewContainer"] {{
+            background: {background};
+        }}
+        .block-container {{
+            padding-top: {"2.2rem" if hero else "1.4rem"};
+            max-width: {"920px" if hero else "1180px"};
+        }}
+        [data-testid="stBaseButton-primary"] {{
+            background: #c6a15b;
+            color: #1c1508;
+            border: none;
+        }}
+        [data-testid="stBaseButton-primary"]:hover {{
+            background: #d4b36e;
+            color: #1c1508;
+        }}
+        {hero_text}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def show_table(rows: list[dict[str, Any]]) -> None:
@@ -1471,54 +1597,48 @@ def _comparison_inputs(results: list[dict[str, Any]]) -> list[ComparisonInput]:
     return built
 
 
+def _needs_pdf_check(results: list[dict[str, Any]]) -> bool:
+    for result in results:
+        for entry in result.get("quotations") or []:
+            data = entry.get("data") if isinstance(entry, dict) else None
+            validation = data.get("validation") if isinstance(data, dict) else None
+            issues = validation.get("issues") if isinstance(validation, dict) else None
+            if any(is_advisory_extraction_warning(issue) for issue in issues or []):
+                return True
+    return False
+
+
 def _render_best_pick(ranking) -> None:
     best = ranking.best
-    st.subheader("Best Pick")
-    if best.pending:
-        st.info(f"{best.headline}. {best.explanation}")
-        return
+    with st.container(border=True, key="best_pick"):
+        st.subheader("Best Pick")
+        if best.pending:
+            st.info(f"{best.headline}. {best.explanation}")
+            return
 
-    st.success(best.headline)
-    total = _money_cell(best.grand_total, best.currency)
-    rating = _rating_cell(best.public_rating)
-    reviews = _count_cell(best.review_count)
-    score = _score_cell(best.combined_score)
-    st.write(
-        f"**Combined score:** {score} · **Quotation total:** {total} · "
-        f"**Public rating:** {rating} · **Review count:** {reviews}"
-    )
-    st.write(best.explanation)
-    if best.warnings:
-        st.warning(" ".join(best.warnings))
-    others = [
-        f"{row.label}: {row.warnings[0]}"
-        for row in ranking.rows
-        if row.critical and row.warnings
-        and row.supplier_key != best.supplier_key
-    ]
-    if others:
-        st.warning("Critical review items: " + "; ".join(others))
+        st.success(best.headline)
+        total = _money_cell(best.grand_total, best.currency)
+        rating = _rating_cell(best.public_rating)
+        reviews = _count_cell(best.review_count)
+        score = _score_cell(best.combined_score)
+        st.write(
+            f"**Combined score:** {score} · **Quotation total:** {total} · "
+            f"**Public rating:** {rating} · **Review count:** {reviews}"
+        )
+        st.write(best.explanation)
+        if best.warnings:
+            st.warning(" ".join(best.warnings))
+        others = [
+            f"{row.label}: {row.warnings[0]}"
+            for row in ranking.rows
+            if row.critical and row.warnings
+            and row.supplier_key != best.supplier_key
+        ]
+        if others:
+            st.warning("Critical review items: " + "; ".join(others))
 
 
-def _render_comparison_table(results: list[dict[str, Any]]) -> None:
-    inputs = _comparison_inputs(results)
-    if not inputs:
-        st.info("No suppliers were extracted to compare.")
-        return
-
-    price_weight = st.slider(
-        "Price weight",
-        min_value=0,
-        max_value=100,
-        value=DEFAULT_PRICE_WEIGHT_PERCENT,
-        step=5,
-        format="%d%%",
-        key="comparison_price_weight",
-        help="Quality receives the remaining share, so the weights sum to 100%.",
-    )
-    st.caption(f"Price {price_weight}% · Quality {100 - price_weight}%")
-
-    ranking = rank_comparisons(inputs, price_weight)
+def _render_comparison_table(ranking) -> None:
     st.subheader("Supplier comparison")
     if ranking.price_only_reason:
         st.caption(ranking.price_only_reason)
@@ -1539,12 +1659,39 @@ def _render_comparison_table(results: list[dict[str, Any]]) -> None:
         }
         for item in ranking.rows
     ])
+
+
+@st.fragment
+def render_weighted_comparison(results: list[dict[str, Any]]) -> None:
+    """Rescore the stored quotations. Does not read PDFs or call Ollama."""
+    price_weight = st.slider(
+        "Price weight",
+        min_value=0,
+        max_value=100,
+        value=DEFAULT_PRICE_WEIGHT_PERCENT,
+        step=5,
+        format="%d%%",
+        key="comparison_price_weight",
+        help=(
+            "Quality receives the remaining share, so the two weights "
+            "sum to 100%. Scores update from the saved quotations."
+        ),
+    )
+    price_weight = int(price_weight)
+    quality_weight = 100 - price_weight
+    st.caption(f"Price {price_weight}% · Quality {quality_weight}%")
+
+    inputs = _comparison_inputs(results)
+    if not inputs:
+        st.info("No suppliers were extracted to compare.")
+        return
+
+    ranking = rank_comparisons(inputs, price_weight)
     _render_best_pick(ranking)
+    _render_comparison_table(ranking)
 
 
 def render_results(results: list[dict[str, Any]]) -> None:
-    st.divider()
-
     for result in results:
         if result.get("success"):
             continue
@@ -1558,8 +1705,14 @@ def render_results(results: list[dict[str, Any]]) -> None:
         st.info("No quotations were extracted.")
         return
 
+    if _needs_pdf_check(results):
+        st.warning(
+            "Extracted values should be checked against the original PDF. "
+            "Unreadable characters were left unchanged."
+        )
+
+    render_weighted_comparison(results)
     render_supplier_ratings(results)
-    _render_comparison_table(results)
 
     saved_ratings = [
         value
@@ -1596,14 +1749,8 @@ def render_results(results: list[dict[str, Any]]) -> None:
 # Page layout
 # ---------------------------------------------------------
 
-st.title("📄 QuoteCompare")
-st.caption("Compare supplier quotations privately on your computer.")
-
-st.info(
-    "Privacy: this app processes PDFs locally and calls your configured "
-    "local Ollama pipeline. Do not configure a cloud-based model endpoint "
-    "if you require fully local processing."
-)
+hero = not bool(st.session_state.get(RESULTS_KEY))
+_apply_theme(hero=hero)
 
 with st.sidebar:
     st.header("Settings")
@@ -1657,27 +1804,49 @@ with st.sidebar:
 # Upload PDFs
 # ---------------------------------------------------------
 
-uploaded_files = st.file_uploader(
-    "Upload supplier quotation PDFs",
-    type=["pdf"],
-    accept_multiple_files=True,
-    help="Select one or more quotations. Bundled PDFs are supported.",
-)
-
-if not uploaded_files:
+if hero:
     st.markdown(
         """
-        ### Get started
-
-        1. Upload your supplier quotation PDFs.
-        2. Process them on this computer.
-        3. Enter a public rating and review count for each supplier.
-        4. Read the comparison table and the Best Pick.
-        """
+        <div class="qc-brand">QUOTECOMPARE</div>
+        <h1 class="qc-headline">Choose a supplier with a clear score.</h1>
+        <p class="qc-lead">
+        Compare quotation totals and public ratings on this computer.
+        The Best Pick is the highest complete score for the weights you set.
+        </p>
+        """,
+        unsafe_allow_html=True,
     )
-    st.stop()
+    upload_panel = st.container(key="hero_panel")
+else:
+    upload_panel = st.sidebar.expander("Upload quotations", expanded=False)
 
-if len(uploaded_files) > MAX_FILES:
+with upload_panel:
+    st.markdown(
+        "Privacy: this app processes PDFs locally and calls your "
+        "configured local Ollama pipeline. Do not configure a "
+        "cloud-based model endpoint if you require fully local processing."
+    )
+    uploaded_files = st.file_uploader(
+        "Upload supplier quotation PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Select one or more quotations. Bundled PDFs are supported.",
+        key="quotation_pdfs",
+    )
+    if not ollama_ok:
+        st.caption(
+            "Ollama did not respond to the health check. You can still "
+            "try processing, but it will probably fail."
+        )
+    process_clicked = st.button(
+        "Process Quotations",
+        type="primary",
+        key="process_quotations",
+    )
+    if process_clicked and not uploaded_files:
+        st.warning("Add at least one PDF before processing.")
+
+if uploaded_files and len(uploaded_files) > MAX_FILES:
     st.error(
         f"You selected {len(uploaded_files)} files. "
         f"Please select at most {MAX_FILES} files per batch."
@@ -1685,7 +1854,7 @@ if len(uploaded_files) > MAX_FILES:
     st.stop()
 
 uploaded_records: list[dict[str, Any]] = []
-for uploaded_file in uploaded_files:
+for uploaded_file in uploaded_files or []:
     raw = uploaded_file.getvalue()
     uploaded_records.append({
         "filename": uploaded_file.name,
@@ -1700,57 +1869,35 @@ if len(set(hashes)) != len(hashes):
         "separately; remove duplicates to save time."
     )
 
-st.subheader("Uploaded quotations")
-
-for index, record in enumerate(uploaded_records):
-    size_mb = len(record["bytes"]) / (1024 * 1024)
-
-    with st.expander(f"{record['filename']} — {size_mb:.2f} MB"):
+if hero:
+    for record in uploaded_records:
+        size_mb = len(record["bytes"]) / (1024 * 1024)
         if size_mb > MAX_FILE_SIZE_MB:
-            st.error(f"This file exceeds the {MAX_FILE_SIZE_MB} MB limit.")
+            st.error(
+                f"{record['filename']} exceeds the "
+                f"{MAX_FILE_SIZE_MB} MB limit."
+            )
             continue
-
         try:
             preview = read_pdf_cached(record["hash"], record["bytes"])
         except Exception as exc:
-            st.error(f"Cannot preview this PDF: {exc}")
+            st.error(f"{record['filename']} could not be read: {exc}")
             continue
-
         affected = [
             d["page"] for d in preview["page_diagnostics"]
             if d.get("unreadable_chars")
         ]
         if affected:
             st.warning(
-                "Unreadable characters were found on page(s) "
-                f"{', '.join(map(str, affected))}. Amounts from those "
-                "pages need review before a Best Pick."
+                f"{record['filename']}: unreadable characters on page(s) "
+                f"{', '.join(map(str, affected))}. Extracted values should "
+                "be checked against the original PDF."
             )
-
         if preview["pages_with_text"] == 0:
             st.warning(
-                "No usable text was found. This PDF may be image-only. "
-                "OCR was not run."
+                f"{record['filename']}: no usable text was found. This PDF "
+                "may be image-only. OCR was not run."
             )
-
-
-# ---------------------------------------------------------
-# Process using the local Ollama pipeline
-# ---------------------------------------------------------
-
-st.divider()
-st.subheader("Process quotations")
-
-st.warning(
-    "AI-extracted values must be checked against the original PDFs. "
-    "A successful run does not guarantee that every value is correct."
-)
-
-if not ollama_ok:
-    st.caption(
-        "Ollama did not respond to the health check in the sidebar. "
-        "You can still try processing, but it will probably fail."
-    )
 
 signature = {
     "hashes": hashes,
@@ -1758,7 +1905,7 @@ signature = {
     "extractor": extraction_fingerprint(),
 }
 
-if st.button("🚀 Process quotations locally", type="primary"):
+if process_clicked and uploaded_records:
     results: list[dict[str, Any]] = []
     progress = st.progress(0.0)
     status = st.empty()
@@ -1803,7 +1950,8 @@ if st.button("🚀 Process quotations locally", type="primary"):
 saved_results = st.session_state.get(RESULTS_KEY)
 saved_signature = st.session_state.get(SIGNATURE_KEY)
 
-if saved_results and saved_signature == signature:
+files_changed = bool(hashes) and saved_signature != signature
+if saved_results and not files_changed:
     render_results(saved_results)
 elif saved_results:
     st.info(

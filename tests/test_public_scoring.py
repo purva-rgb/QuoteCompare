@@ -4,8 +4,10 @@ import pytest
 
 from engine.ratings import SupplierRef, supplier_key
 from engine.scoring import (
+    BEST_PICK_UNAVAILABLE,
     DEFAULT_PRICE_WEIGHT_PERCENT,
     ComparisonInput,
+    is_advisory_extraction_warning,
     is_critical_issue,
     price_score_from_totals,
     quality_score_from_public_rating,
@@ -88,6 +90,59 @@ def test_custom_weights_sum_to_100():
         rank_comparisons([row("Low", 100, 5)], price_weight_percent=101)
 
 
+def test_changing_weights_changes_scores_and_can_change_the_best_pick():
+    suppliers = [
+        row("Low price", 100, 2, key="cheap"),
+        row("High rating", 200, 5, key="rated"),
+    ]
+
+    price_heavy = rank_comparisons(suppliers, price_weight_percent=80)
+    quality_heavy = rank_comparisons(suppliers, price_weight_percent=20)
+
+    assert price_heavy.price_weight_percent == 80
+    assert 80 + (100 - price_heavy.price_weight_percent) == 100
+    assert 20 + (100 - quality_heavy.price_weight_percent) == 100
+
+    # Price and quality scores do not depend on the weight.
+    assert by_key(price_heavy)["cheap"].price_score == pytest.approx(100)
+    assert by_key(price_heavy)["rated"].price_score == pytest.approx(50)
+    assert by_key(quality_heavy)["cheap"].quality_score == pytest.approx(40)
+    assert by_key(quality_heavy)["rated"].quality_score == pytest.approx(100)
+
+    # 80/20: cheap 88, rated 60. 20/80: cheap 52, rated 90.
+    assert by_key(price_heavy)["cheap"].combined_score == pytest.approx(88)
+    assert by_key(price_heavy)["rated"].combined_score == pytest.approx(60)
+    assert price_heavy.best.supplier_key == "cheap"
+    assert price_heavy.rows[0].supplier_key == "cheap"
+
+    assert by_key(quality_heavy)["cheap"].combined_score == pytest.approx(52)
+    assert by_key(quality_heavy)["rated"].combined_score == pytest.approx(90)
+    assert quality_heavy.best.supplier_key == "rated"
+    assert quality_heavy.rows[0].supplier_key == "rated"
+    assert "weighted 20%" in quality_heavy.best.explanation
+    assert "quality 80%" in quality_heavy.best.explanation
+
+
+def test_weight_change_does_not_score_missing_or_invalid_totals():
+    suppliers = [
+        row("Open", 100, None, reviews=None, key="open"),
+        row("Bad", None, 5, key="bad", eligible=False),
+        row("Good", 120, 4, key="good"),
+    ]
+
+    for weight in (0, 70, 100):
+        ranking = rank_comparisons(suppliers, price_weight_percent=weight)
+        assert ranking.price_weight_percent == weight
+        assert ranking.price_weight_percent + (
+            100 - ranking.price_weight_percent
+        ) == 100
+        assert by_key(ranking)["open"].quality_score is None
+        assert by_key(ranking)["open"].combined_score is None
+        assert by_key(ranking)["bad"].price_score is None
+        assert by_key(ranking)["bad"].combined_score is None
+        assert ranking.best.supplier_key == "good"
+
+
 def test_missing_public_rating_does_not_invent_a_combined_score():
     ranking = rank_comparisons([
         row("Rated", 100, 4, key="rated"),
@@ -150,9 +205,8 @@ def test_only_a_critical_supplier_leaves_the_best_pick_pending():
     ])
 
     assert ranking.best.pending is True
-    assert ranking.best.headline == (
-        "Best Pick pending — more information required"
-    )
+    assert ranking.best.headline == BEST_PICK_UNAVAILABLE
+    assert ranking.best.supplier_key is None
     assert "Tax rate is unknown." in ranking.best.explanation
 
 
@@ -212,3 +266,104 @@ def test_ratings_stay_with_the_supplier_key_not_the_display_name():
     assert scored[supplier_key(first)].review_count == 10
     assert scored[supplier_key(second)].review_count == 80
     assert ranking.best.supplier_key == supplier_key(first)
+
+
+GLYPH_WARNING = (
+    "Extraction uncertainty: 4 unreadable character(s) were left unchanged. "
+    "Verify amounts and currency against the PDF. This is not an arithmetic "
+    "error."
+)
+UNCONFIRMED_CURRENCY = (
+    "Extraction uncertainty: currency INR was not confirmed by an "
+    "explicit code or unambiguous symbol in the text. Verify it manually."
+)
+
+
+def test_higher_combined_score_beats_the_lowest_price():
+    ranking = rank_comparisons([
+        row("Cheap", 100, 1, key="cheap"),
+        row("Balanced", 130, 5, key="balanced"),
+    ])
+
+    cheap = by_key(ranking)["cheap"]
+    balanced = by_key(ranking)["balanced"]
+    assert cheap.price_score == pytest.approx(100)
+    assert cheap.price_score > balanced.price_score
+    assert balanced.combined_score > cheap.combined_score
+    assert ranking.best.pending is False
+    assert ranking.best.supplier_key == "balanced"
+    assert ranking.rows[0].supplier_key == ranking.best.supplier_key
+    assert ranking.best.combined_score == pytest.approx(
+        balanced.combined_score
+    )
+
+
+def test_glyph_warning_alone_does_not_block_best_pick():
+    assert is_advisory_extraction_warning(GLYPH_WARNING) is True
+    assert is_critical_issue(GLYPH_WARNING) is False
+    assert is_critical_issue(UNCONFIRMED_CURRENCY) is True
+
+    ranking = rank_comparisons([
+        row("Checked", 140, 5, key="checked", warnings=(GLYPH_WARNING,)),
+        row("Cheap", 100, 1, key="cheap"),
+    ])
+
+    assert ranking.best.pending is False
+    assert ranking.best.supplier_key == "checked"
+    assert by_key(ranking)["cheap"].price_score > by_key(ranking)["checked"].price_score
+
+
+def test_unresolved_currency_still_blocks_the_winner():
+    ranking = rank_comparisons([
+        row(
+            "Unconfirmed",
+            100,
+            5,
+            key="unconfirmed",
+            critical=True,
+            warnings=(UNCONFIRMED_CURRENCY,),
+        ),
+        row("Clear", 150, 4, key="clear"),
+    ])
+
+    assert ranking.best.supplier_key == "clear"
+    assert ranking.best.supplier_key != "unconfirmed"
+
+
+def test_missing_rating_cannot_be_a_best_pick():
+    ranking = rank_comparisons([
+        row("Open", 100, None, reviews=None, key="open"),
+    ])
+
+    assert ranking.best.pending is True
+    assert ranking.best.headline == BEST_PICK_UNAVAILABLE
+    assert ranking.best.supplier_key is None
+    assert ranking.best.combined_score is None
+    assert "public rating" in ranking.best.explanation.casefold()
+
+
+def test_best_pick_matches_the_highest_eligible_table_score():
+    ranking = rank_comparisons([
+        row("Cheap", 100, 1, key="cheap"),
+        row("Balanced", 140, 5, key="balanced"),
+        row(
+            "Broken",
+            80,
+            5,
+            key="broken",
+            critical=True,
+            warnings=("Tax total is unknown.",),
+        ),
+    ])
+
+    eligible = [
+        item for item in ranking.rows
+        if item.combined_score is not None and item.eligible and not item.critical
+    ]
+    leader = max(eligible, key=lambda item: item.combined_score or 0)
+    assert leader.supplier_key == "balanced"
+    assert ranking.best.pending is False
+    assert ranking.best.supplier_key == leader.supplier_key
+    assert ranking.best.combined_score == pytest.approx(leader.combined_score)
+    assert ranking.rows[0].supplier_key == "broken"
+    assert ranking.best.supplier_key != ranking.rows[0].supplier_key

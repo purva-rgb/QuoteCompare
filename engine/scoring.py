@@ -204,6 +204,7 @@ def winner_ranges(
 # ---------------------------------------------------------
 
 DEFAULT_PRICE_WEIGHT_PERCENT = 70
+BEST_PICK_UNAVAILABLE = "Best Pick unavailable"
 
 _CRITICAL_MARKERS = (
     "tax",
@@ -211,7 +212,6 @@ _CRITICAL_MARKERS = (
     "subtotal",
     "quotation total",
     "currenc",
-    "extraction uncertainty",
     "not comparable",
     "invalid",
 )
@@ -274,8 +274,23 @@ class Ranking:
     price_weight_percent: float
 
 
+def is_advisory_extraction_warning(issue: str) -> bool:
+    """Unreadable glyphs are a review note, not a failed financial check.
+
+    The validator keeps the original message. A currency that is missing,
+    unconfirmed, or in conflict is not this kind of note.
+    """
+    text = issue.casefold()
+    return (
+        "extraction uncertainty" in text
+        and "unreadable character" in text
+    )
+
+
 def is_critical_issue(issue: str) -> bool:
     """Price, tax, currency, or comparability problems block a Best Pick."""
+    if is_advisory_extraction_warning(issue):
+        return False
     text = issue.casefold()
     return any(marker in text for marker in _CRITICAL_MARKERS)
 
@@ -486,7 +501,7 @@ def rank_comparisons(
             missing.append("Critical review items: " + "; ".join(notes) + ".")
         best = BestPick(
             pending=True,
-            headline="Best Pick pending — more information required",
+            headline=BEST_PICK_UNAVAILABLE,
             explanation=" ".join(missing) or (
                 "A complete price score and quality score are required."
             ),
@@ -501,7 +516,7 @@ def rank_comparisons(
             names = ", ".join(row.label for row in leaders)
             best = BestPick(
                 pending=True,
-                headline="Best Pick pending — more information required",
+                headline=BEST_PICK_UNAVAILABLE,
                 explanation=(
                     f"{names} share the highest combined score, so no "
                     "single supplier is selected."
