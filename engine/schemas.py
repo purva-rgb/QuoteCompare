@@ -1,4 +1,3 @@
-
 from decimal import Decimal
 from typing import Literal
 
@@ -56,6 +55,11 @@ class QuotationTotals(StrictModel):
     subtotal: Decimal | None = Field(default=None, ge=0)
     tax_total: Decimal | None = Field(default=None, ge=0)
     grand_total: Decimal | None = Field(default=None, ge=0)
+
+    # Tax rate stated once for the whole quotation, as a percentage
+    # (for example 18 for "GST (18%)"). Line items may leave tax_rate
+    # empty when the document states tax only at this level.
+    tax_rate: Decimal | None = Field(default=None, ge=0, le=100)
 
 
 class ValidationResult(StrictModel):

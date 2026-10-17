@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+from decimal import Decimal
 from functools import lru_cache
 from typing import Any, Callable
 
@@ -85,7 +86,15 @@ OLLAMA_MAX_ATTEMPTS = max(1, _env_int("OLLAMA_MAX_ATTEMPTS", 2))
 # comma-separated OLLAMA_OMIT_FIELDS (set it empty to omit nothing).
 DEFAULT_OMITTED_FIELDS = ("validation", "match_status", "warnings")
 
-EXTRACTOR_VERSION = "4"
+# Currency codes recognised when a page states one in parentheses, such as
+# the column header "Amount (INR)".
+KNOWN_CURRENCIES = {
+    "INR", "USD", "EUR", "GBP", "AED", "SGD", "AUD", "CAD",
+    "JPY", "CNY", "CHF", "NZD", "ZAR",
+}
+_CODE_IN_PARENS = re.compile(r"\(([A-Z]{3})\)")
+
+EXTRACTOR_VERSION = "7"
 
 
 SYSTEM_INSTRUCTIONS = """
@@ -470,6 +479,159 @@ def _check_result_limits(result: dict[str, Any]) -> None:
         )
 
 
+def _slugify(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", text.casefold()).strip("_")[:60]
+
+
+def _stated_currency(pdf_text: str) -> str | None:
+    """The one currency code the page states in parentheses, if exactly one."""
+    codes = {
+        code for code in _CODE_IN_PARENS.findall(pdf_text)
+        if code in KNOWN_CURRENCIES
+    }
+    return next(iter(codes)) if len(codes) == 1 else None
+
+
+# The number must contain a digit, so a label followed by ordinary words
+# ("Quotation No." then "Prepared for") never captures a word. A single line
+# break between label and value is allowed because PDF text extraction
+# sometimes splits them.
+_QUOTATION_NUMBER = re.compile(
+    r"\bquotation[ \t]*(?:no\.?|number|#)[ \t]*[:.\-]?\s{0,3}"
+    r"(?=[A-Z0-9\-/_.]*\d)([A-Z0-9][A-Z0-9\-/_.]*[A-Z0-9])",
+    re.IGNORECASE,
+)
+
+# "Date 15 October 2026", but not "Event date", "Due date" and similar.
+_QUOTATION_DATE = re.compile(
+    r"(?<!event )(?<!delivery )(?<!due )(?<!expiry )(?<!valid )"
+    r"(?<!payment )(?<!start )(?<!end )"
+    r"\bdate\b[ \t]*[:.\-]?\s{0,3}"
+    r"(\d{1,2}[ \t]+[A-Za-z]{3,9}[ \t]+\d{4}"
+    r"|\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}"
+    r"|\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
+
+_TAX_RATE = re.compile(
+    r"\b(?:GST|IGST|VAT|sales[ \t]+tax|tax)[ \t]*"
+    r"\([ \t]*(\d{1,2}(?:\.\d+)?)[ \t]*%[ \t]*\)",
+    re.IGNORECASE,
+)
+
+# Totals printed as a labelled line ending in an amount, for example
+# "Subtotal INR 182,000.00" or "GST (18%) INR 32,760.00". The label must
+# start the line, so "Subtotal" is never read as "Total".
+_AMOUNT = r"(\d[\d,]*(?:\.\d{1,2})?)"
+_SUBTOTAL_LINE = re.compile(
+    r"^[ \t]*sub[ \t\-]*total\b\D*?" + _AMOUNT + r"[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_TAX_TOTAL_LINE = re.compile(
+    r"^[ \t]*(?:GST|IGST|VAT|sales[ \t]+tax|tax)\b"
+    r"(?:[ \t]*\([ \t]*\d{1,2}(?:\.\d+)?[ \t]*%[ \t]*\))?"
+    r"\D*?" + _AMOUNT + r"[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_GRAND_TOTAL_LINE = re.compile(
+    r"^[ \t]*(?:grand[ \t]+total|total[ \t]+payable"
+    r"|total[ \t]+amount(?:[ \t]+payable)?|total[ \t]+due|total)\b"
+    r"\D*?" + _AMOUNT + r"[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _stated_amount(pattern: re.Pattern[str], text: str) -> Decimal | None:
+    """The single amount a labelled total line states, if exactly one."""
+    value = _unique_match(pattern, text)
+
+    if value is None:
+        return None
+
+    try:
+        return Decimal(value.replace(",", ""))
+    except Exception:
+        return None
+
+
+def _unique_match(pattern: re.Pattern[str], text: str) -> str | None:
+    """The single distinct value the pattern finds, or None if 0 or 2+."""
+    found = {
+        " ".join(match.split()).rstrip(".,;")
+        for match in pattern.findall(text)
+    }
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def _apply_stated_facts(quotation: Quotation, pdf_text: str) -> None:
+    """
+    Fill header facts the model left empty, but only from text that
+    explicitly states them and only when the match is unambiguous.
+    Anything unclear stays empty. Each fill is recorded in the notes.
+    """
+    filled: list[str] = []
+
+    def fill(label: str, setter: Any) -> None:
+        try:
+            setter()
+            filled.append(label)
+        except Exception:
+            logger.debug("Could not set %s.", label, exc_info=True)
+
+    vendor = quotation.vendor
+
+    if not vendor.quotation_number:
+        number = _unique_match(_QUOTATION_NUMBER, pdf_text)
+        if number:
+            fill("quotation number",
+                 lambda: setattr(vendor, "quotation_number", number))
+
+    if not vendor.quotation_date:
+        date = _unique_match(_QUOTATION_DATE, pdf_text)
+        if date:
+            fill("quotation date",
+                 lambda: setattr(vendor, "quotation_date", date))
+
+    if not vendor.currency:
+        currency = _stated_currency(pdf_text)
+        if currency:
+            fill("currency",
+                 lambda: setattr(vendor, "currency", currency))
+
+    # Split taxes (CGST + SGST) would each show a partial rate, so skip.
+    # A rate the page states wins over a different model value, because
+    # small models sometimes return 0.18 where the page says 18%.
+    if not re.search(r"\b[CS]GST\b", pdf_text, re.IGNORECASE):
+        rate = _unique_match(_TAX_RATE, pdf_text)
+        if rate:
+            stated_rate = Decimal(rate)
+            current = quotation.totals.tax_rate
+            if current is None or current != stated_rate:
+                fill("tax rate",
+                     lambda: setattr(quotation.totals, "tax_rate",
+                                     stated_rate))
+
+    # Totals the model dropped but the page prints on labelled lines.
+    totals = quotation.totals
+    for field_name, label, pattern in (
+        ("subtotal", "subtotal", _SUBTOTAL_LINE),
+        ("tax_total", "tax total", _TAX_TOTAL_LINE),
+        ("grand_total", "grand total", _GRAND_TOTAL_LINE),
+    ):
+        if getattr(totals, field_name) is None:
+            amount = _stated_amount(pattern, pdf_text)
+            if amount is not None:
+                fill(label,
+                     lambda f=field_name, v=amount: setattr(totals, f, v))
+
+    if filled:
+        quotation.extraction_notes.append(
+            "Read from the page text by pattern where the model left a "
+            f"value empty or disagreed with the text: {', '.join(filled)}. "
+            "Verify against the PDF."
+        )
+
+
 def _build_quotation(result: dict[str, Any]) -> Quotation:
     """Parse and validate one model response. Raises ValueError."""
     content = result.get("response")
@@ -480,7 +642,10 @@ def _build_quotation(result: dict[str, Any]) -> Quotation:
     try:
         data = _clean_json_response(content)
 
-        # Assign stable IDs when the model omitted or duplicated IDs.
+        # Item IDs are assigned here, never taken from the model. Small
+        # models reuse the wrong text as an ID (one run gave an item the
+        # quotation number). The ID is a readable slug of the description,
+        # made unique, so validation messages and matching stay stable.
         items = data.get("items")
         if not isinstance(items, list):
             raise ValueError("Missing or invalid items list.")
@@ -490,12 +655,16 @@ def _build_quotation(result: dict[str, Any]) -> Quotation:
             if not isinstance(item, dict):
                 raise ValueError("Each item must be a JSON object.")
 
-            candidate = item.get("item_id")
-            if not isinstance(candidate, str) or not candidate.strip():
+            description = item.get("original_description")
+            candidate = _slugify(description) if isinstance(
+                description, str
+            ) else ""
+
+            if not candidate:
                 candidate = f"item_{index:04d}"
 
             if candidate in seen:
-                candidate = f"item_{index:04d}"
+                candidate = f"{candidate}_{index}"
 
             item["item_id"] = candidate
             seen.add(candidate)
@@ -568,6 +737,9 @@ def extract_quotation(pdf_text: str) -> Quotation:
             note += f" Needed {attempt} attempts."
 
         quotation.extraction_notes.append(note)
+
+        _apply_stated_facts(quotation, pdf_text)
+
         return quotation
 
     raise ValueError(

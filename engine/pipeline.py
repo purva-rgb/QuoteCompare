@@ -1,4 +1,3 @@
-
 """Main processing pipeline for QuoteCompare."""
 
 from __future__ import annotations
@@ -60,7 +59,8 @@ def process_extracted_quotation(
     except Exception as exc:
         logger.exception("Unexpected quotation processing failure.")
         raise QuotationProcessingError(
-            "Could not safely process the extracted quotation."
+            "Could not safely process the extracted quotation: "
+            f"{type(exc).__name__}: {exc}"
         ) from exc
 
 
@@ -68,7 +68,8 @@ def process_quotation_text(pdf_text: str) -> Quotation:
     """
     Run the complete local pipeline from extracted PDF text.
 
-    PDF reading/OCR happens before this function.
+    PDF reading/OCR happens before this function. Page splitting is done
+    by the caller (app.py), which calls this once per quotation.
     """
     if not isinstance(pdf_text, str):
         raise TypeError("pdf_text must be a string.")
@@ -89,41 +90,13 @@ def process_quotation_text(pdf_text: str) -> Quotation:
     except (ValueError, TypeError, ValidationError):
         # These errors contain useful information for debugging.
         raise
+    except QuotationProcessingError:
+        raise
     except Exception as exc:
+        # Includes the extractor's RuntimeError for Ollama problems
+        # (not running, model missing, timeout). Keep its message so the
+        # user sees the real cause instead of a generic failure.
         logger.exception("Quotation extraction pipeline failed.")
         raise QuotationProcessingError(
-            "Quotation extraction failed. "
-            "Check the application logs for details."
+            f"Quotation extraction failed: {exc}"
         ) from exc
-
-def process_quotation_pages(page_texts: list[str]) -> list[Quotation]:
-    """Process each PDF page as an independent supplier quotation."""
-    if not page_texts:
-        raise QuotationProcessingError("The PDF contains no pages to process.")
-
-    results: list[Quotation] = []
-
-    for page_number, page_text in enumerate(page_texts, start=1):
-        if not page_text or not page_text.strip():
-            logger.warning("Skipping empty PDF page %s.", page_number)
-            continue
-
-        logger.info("Processing quotation page %s...", page_number)
-
-        try:
-            quotation = process_quotation_text(page_text)
-            results.append(quotation)
-        except Exception as exc:
-            logger.exception(
-                "Failed to process quotation page %s.", page_number
-            )
-            raise QuotationProcessingError(
-                f"Could not process PDF page {page_number}: {exc}"
-            ) from exc
-
-    if not results:
-        raise QuotationProcessingError(
-            "No pages contained extractable quotation text."
-        )
-
-    return results

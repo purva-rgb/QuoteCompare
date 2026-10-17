@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any, Callable
@@ -20,9 +21,25 @@ from engine.extractor import (
     extraction_fingerprint,
     set_progress_hook,
 )
+from engine.matcher import find_candidates
 from engine.pipeline import (
     QuotationProcessingError,
     process_quotation_text,
+)
+from engine.recommender import (
+    STATUS_NONE,
+    STATUS_SINGLE_ELIGIBLE,
+    QuotationEntry,
+    Recommendation,
+    recommend,
+)
+from engine.schemas import Quotation
+from engine.scoring import (
+    CRITERIA,
+    ScoreInput,
+    score_suppliers,
+    validate_rating,
+    winner_ranges,
 )
 
 
@@ -41,6 +58,18 @@ MIN_PAGE_CHARS = 30              # below this a page is treated as blank
 # Characters PDFs draw when a font lacks a glyph (for example a rupee sign).
 # Amounts and currency near them cannot be trusted without checking the PDF.
 PLACEHOLDER_CHARS = "\u25a0\u25a1\u25af\ufffd"
+
+# A placeholder directly before a number is treated as the currency sign,
+# but only when the page names exactly one currency code in parentheses,
+# for example the column header "Amount (INR)".
+CURRENCY_CODES = {
+    "INR", "USD", "EUR", "GBP", "AED", "SGD", "AUD", "CAD",
+    "JPY", "CNY", "CHF", "NZD", "ZAR",
+}
+_CODE_IN_PARENS = re.compile(r"\(([A-Z]{3})\)")
+_PLACEHOLDER_BEFORE_NUMBER = re.compile(
+    "[" + re.escape(PLACEHOLDER_CHARS) + r"]\s?(?=\d)"
+)
 MAX_CONSECUTIVE_FAILURES = 2     # stop a file early if the model keeps failing
 
 # Model, URL and timeout come from engine/extractor.py so the app
@@ -54,6 +83,7 @@ MODE_WHOLE = "The whole PDF is one quotation"
 RESULTS_KEY = "quotecompare_results"
 SIGNATURE_KEY = "quotecompare_signature"
 PAGE_CACHE_KEY = "quotecompare_page_cache"
+RATINGS_KEY = "quotecompare_ratings"  # kept when cached results are cleared
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -131,6 +161,34 @@ def get_issues(validation: dict[str, Any]) -> list[str]:
 def count_placeholders(text: str) -> int:
     """Count characters that stand in for a glyph the PDF font lacked."""
     return sum(text.count(ch) for ch in PLACEHOLDER_CHARS)
+
+
+def repair_currency_placeholders(
+    text: str,
+) -> tuple[str, dict[str, Any] | None]:
+    """
+    Replace placeholder boxes that sit directly before numbers with the
+    currency code the page itself states (for example "Amount (INR)").
+
+    Nothing is changed unless the page names exactly one known currency
+    code. Returns the text and, when a repair was made, a description of it
+    so the app can tell the user.
+    """
+    codes = {
+        code for code in _CODE_IN_PARENS.findall(text)
+        if code in CURRENCY_CODES
+    }
+
+    if len(codes) != 1:
+        return text, None
+
+    code = next(iter(codes))
+    repaired, count = _PLACEHOLDER_BEFORE_NUMBER.subn(f"{code} ", text)
+
+    if count == 0:
+        return text, None
+
+    return repaired, {"currency": code, "replaced": count}
 
 
 def unreadable_chars_for(result: dict[str, Any], page: int | None) -> int:
@@ -250,7 +308,10 @@ def read_pdf_cached(file_hash: str, _file_bytes: bytes) -> dict[str, Any]:
 # Processing
 # ---------------------------------------------------------
 
-def run_pipeline_cached(text: str) -> tuple[dict[str, Any], bool]:
+def run_pipeline_cached(
+    text: str,
+    repair: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bool]:
     """Run the pipeline on one text block. Returns (data, was_cached)."""
     cache: dict[str, dict[str, Any]] = st.session_state.setdefault(
         PAGE_CACHE_KEY, {}
@@ -270,6 +331,19 @@ def run_pipeline_cached(text: str) -> tuple[dict[str, Any], bool]:
         raise QuotationProcessingError(
             "The pipeline returned an unexpected result type."
         )
+
+    if repair:
+        note = (
+            "The PDF's font could not draw the currency symbol (it appears "
+            f"as a box). It was treated as {repair['currency']} because the "
+            f"page states ({repair['currency']}) in its header. "
+            "Verify against the source PDF."
+        )
+        notes = data.get("extraction_notes")
+        if isinstance(notes, list):
+            notes.append(note)
+        else:
+            data["extraction_notes"] = [note]
 
     cache[key] = data
     while len(cache) > MAX_CACHED_PAGES:
@@ -329,7 +403,7 @@ def process_one_file(
         )
 
     # Build the list of (page_number_or_None, text) jobs.
-    jobs: list[tuple[int | None, str]] = []
+    jobs: list[tuple[int | None, str, dict[str, Any] | None]] = []
 
     if mode == MODE_WHOLE:
         text = pdf_result["text"]
@@ -341,7 +415,8 @@ def process_one_file(
                     "Switch to per-page mode or split the PDF."
                 )
             )
-        jobs.append((None, text))
+        repaired, repair = repair_currency_placeholders(text)
+        jobs.append((None, repaired, repair))
     else:
         for page_number, text in enumerate(pdf_result["page_texts"], start=1):
             if len(text) < MIN_PAGE_CHARS:
@@ -357,7 +432,8 @@ def process_one_file(
                     ),
                 })
             else:
-                jobs.append((page_number, text))
+                repaired, repair = repair_currency_placeholders(text)
+                jobs.append((page_number, repaired, repair))
 
     if not jobs and not base["page_errors"]:
         return finish(error="No pages contained enough text to process.")
@@ -365,7 +441,7 @@ def process_one_file(
     consecutive_failures = 0
     total = max(len(jobs), 1)
 
-    for position, (page_number, text) in enumerate(jobs):
+    for position, (page_number, text, repair) in enumerate(jobs):
         label = (
             f"page {page_number}" if page_number is not None else "whole PDF"
         )
@@ -383,8 +459,12 @@ def process_one_file(
         report(f"{filename}: processing {label}", position / total)
 
         try:
-            data, _was_cached = run_pipeline_cached(text)
-            base["quotations"].append({"page": page_number, "data": data})
+            data, _was_cached = run_pipeline_cached(text, repair)
+            base["quotations"].append({
+                "page": page_number,
+                "data": data,
+                "placeholder_repair": repair,
+            })
             consecutive_failures = 0
 
         except (QuotationProcessingError, ValueError, RuntimeError) as exc:
@@ -482,6 +562,525 @@ def build_line_items_csv(results: list[dict[str, Any]]) -> str:
                 })
 
     return buffer.getvalue()
+
+
+# ---------------------------------------------------------
+# Supplier comparison (candidates only, never auto-confirmed)
+# ---------------------------------------------------------
+
+STATUS_TEXT = {
+    "candidate_strong": "Strong candidate",
+    "candidate_possible": "Possible candidate",
+    "needs_review": "Needs review (specification conflict)",
+}
+
+
+def _text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _qty_unit(item: dict[str, Any] | None) -> str:
+    if not item:
+        return ""
+
+    parts = (_text(item.get("quantity")), _text(item.get("unit")))
+    return " ".join(part for part in parts if part)
+
+
+def _as_number(value: Any) -> float | None:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _same_basis(
+    left: dict[str, Any] | None,
+    right: dict[str, Any] | None,
+) -> str:
+    """Say whether two items are priced on the same quantity and unit."""
+    if not left or not right:
+        return ""
+
+    qty_left, qty_right = left.get("quantity"), right.get("quantity")
+    unit_left = _text(left.get("unit")).strip().casefold()
+    unit_right = _text(right.get("unit")).strip().casefold()
+
+    if qty_left is None or qty_right is None or not unit_left or not unit_right:
+        return "Check quantity and unit (missing)"
+
+    number_left, number_right = _as_number(qty_left), _as_number(qty_right)
+    if number_left is not None and number_right is not None:
+        same_qty = abs(number_left - number_right) < 1e-9
+    else:
+        same_qty = _text(qty_left) == _text(qty_right)
+
+    if same_qty and unit_left == unit_right:
+        return "Same quantity and unit"
+
+    return "Different quantity or unit"
+
+
+def _items_by_id(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(item.get("item_id")): item
+        for item in (data.get("items") or [])
+        if isinstance(item, dict)
+    }
+
+
+def build_comparison_pool(
+    results: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Collect every extracted quotation as a comparable entry."""
+    pool: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    used_labels: set[str] = set()
+
+    for result in results:
+        for entry in result.get("quotations", []):
+            data = entry["data"]
+            vendor = data.get("vendor")
+            name = vendor.get("name") if isinstance(vendor, dict) else None
+            where = result["filename"] + (
+                f", page {entry['page']}" if entry["page"] else ""
+            )
+            label = f"{name or 'Unnamed supplier'} ({where})"
+
+            if label in used_labels:
+                label = f"{label} #{len(pool) + 1}"
+            used_labels.add(label)
+
+            try:
+                quotation = Quotation.model_validate(data)
+            except Exception:
+                logger.warning("Could not rebuild %s for comparison.", label)
+                skipped.append(label)
+                continue
+
+            pool.append({"label": label, "data": data, "quotation": quotation})
+
+    return pool, skipped
+
+
+def build_comparison_rows(
+    pool: list[dict[str, Any]],
+    base_index: int,
+    threshold: float,
+) -> list[dict[str, Any]]:
+    """One row per (base item, other supplier) with the closest candidate."""
+    base = pool[base_index]
+    base_items = _items_by_id(base["data"])
+    rows: list[dict[str, Any]] = []
+
+    for item in base["quotation"].items:
+        base_dict = base_items.get(str(item.item_id))
+
+        for other_index, other in enumerate(pool):
+            if other_index == base_index:
+                continue
+
+            row: dict[str, Any] = {
+                "Base item": item.original_description,
+                "Compared supplier": other["label"],
+            }
+
+            try:
+                candidates = find_candidates(
+                    item, other["quotation"], threshold
+                )
+            except Exception:
+                logger.exception(
+                    "Matching failed for %s against %s",
+                    item.item_id,
+                    other["label"],
+                )
+                candidates = None
+
+            if candidates is None:
+                row["Closest item"] = "Matching failed (see terminal)"
+                rows.append(row)
+                continue
+
+            if not candidates:
+                row["Closest item"] = "No close match"
+                rows.append(row)
+                continue
+
+            best = candidates[0]
+            other_dict = _items_by_id(other["data"]).get(
+                str(best["candidate_item_id"])
+            )
+
+            row.update({
+                "Closest item": _text(
+                    (other_dict or {}).get("original_description")
+                ),
+                "Name similarity": best["similarity"],
+                "Status": STATUS_TEXT.get(best["status"], best["status"]),
+                "Specification conflicts": ", ".join(
+                    best["conflicting_specifications"]
+                ),
+                "Basis": _same_basis(base_dict, other_dict),
+                "Base qty / unit": _qty_unit(base_dict),
+                "Their qty / unit": _qty_unit(other_dict),
+                "Base unit price": _text((base_dict or {}).get("unit_price")),
+                "Their unit price": _text(
+                    (other_dict or {}).get("unit_price")
+                ),
+                "Base line total": _text((base_dict or {}).get("line_total")),
+                "Their line total": _text(
+                    (other_dict or {}).get("line_total")
+                ),
+            })
+            rows.append(row)
+
+    return rows
+
+
+def recommendation_rows(rec: Recommendation) -> list[dict[str, Any]]:
+    rows = []
+
+    for a in rec.assessments:
+        if a.eligible:
+            status = "In the tie band" if a.within_tie_band else "Ranked"
+            notes = list(a.cautions)
+        else:
+            status = "Not ranked"
+            notes = list(a.ineligible_reasons)
+
+        rows.append({
+            "Rank": a.rank if a.rank is not None else "-",
+            "Quotation": a.label,
+            "Grand total": (
+                f"{a.currency + ' ' if a.currency else ''}"
+                f"{a.grand_total:,.2f}"
+                if a.grand_total is not None else "Not extracted"
+            ),
+            "Above lowest": (
+                f"{a.difference_from_lowest:,.2f} "
+                f"({a.percent_above_lowest}%)"
+                if a.difference_from_lowest is not None else ""
+            ),
+            "Status": status,
+            "Review notes": " ".join(notes),
+        })
+
+    return rows
+
+
+def render_recommendation(
+    pool: list[dict[str, Any]],
+) -> Recommendation | None:
+    st.markdown("**Recommendation**")
+
+    tie_margin = st.slider(
+        "Treat totals within this percentage of the lowest as a tie",
+        min_value=0.0,
+        max_value=10.0,
+        value=2.0,
+        step=0.5,
+        key="recommend_tie_margin",
+        help=(
+            "If more than one quotation is inside this band, no single "
+            "winner is named and scope and terms should decide."
+        ),
+    )
+
+    try:
+        rec = recommend(
+            [QuotationEntry(p["label"], p["quotation"]) for p in pool],
+            tie_margin_percent=str(tie_margin),
+        )
+    except Exception:
+        logger.exception("Recommendation failed.")
+        st.error("The recommendation could not be calculated. See the terminal.")
+        return None
+
+    if rec.status == STATUS_NONE:
+        st.warning(rec.headline)
+    elif rec.status == STATUS_SINGLE_ELIGIBLE:
+        st.info(rec.headline)
+    else:
+        st.success(rec.headline)
+
+    show_table(recommendation_rows(rec))
+
+    scope_rows = [
+        {
+            "Quotation": a.label,
+            "Items only in this quotation": ", ".join(a.extra_items),
+            "Items other quotations have that this lacks": ", ".join(
+                a.missing_items
+            ),
+        }
+        for a in rec.assessments
+        if a.extra_items or a.missing_items
+    ]
+
+    if scope_rows:
+        with st.expander("Scope differences (approximate)"):
+            show_table(scope_rows)
+
+    for note in rec.notes:
+        st.caption(note)
+
+    return rec
+
+
+def _clean_records(edited: Any) -> list[dict[str, Any]]:
+    """Editor results arrive as a DataFrame or a list of dicts."""
+    if hasattr(edited, "to_dict"):
+        return list(edited.to_dict("records"))
+
+    return [dict(row) for row in edited]
+
+
+def render_scorecard(rec: Recommendation) -> None:
+    st.markdown("**Service quality and weighted score**")
+    st.caption(
+        "Ratings are your own judgement: quotation PDFs do not contain "
+        "service quality, and the app does not look suppliers up online so "
+        "that everything stays local. Rate from 1 (poor) to 5 (excellent), "
+        "leave a cell empty if you have no basis for a rating, and note "
+        "your evidence so the score can be defended."
+    )
+
+    labels = [a.label for a in rec.assessments]
+    store: dict[str, dict[str, Any]] = st.session_state.setdefault(
+        RATINGS_KEY, {}
+    )
+
+    rows = []
+    for label in labels:
+        saved = store.get(label, {})
+        row: dict[str, Any] = {"Quotation": label}
+        for criterion in CRITERIA:
+            row[criterion] = saved.get(criterion)
+        row["Evidence / notes"] = saved.get("notes", "")
+        rows.append(row)
+
+    editor_key = "ratings_editor_" + sha256_bytes(
+        "|".join(labels).encode("utf-8")
+    )[:12]
+
+    column_config = {
+        criterion: st.column_config.NumberColumn(
+            criterion, min_value=1, max_value=5, step=1, format="%d"
+        )
+        for criterion in CRITERIA
+    }
+    column_config["Evidence / notes"] = st.column_config.TextColumn(
+        "Evidence / notes"
+    )
+
+    try:
+        edited = st.data_editor(
+            rows,
+            key=editor_key,
+            hide_index=True,
+            disabled=["Quotation"],
+            column_config=column_config,
+            width="stretch",
+        )
+    except TypeError:
+        edited = st.data_editor(
+            rows,
+            key=editor_key,
+            hide_index=True,
+            disabled=["Quotation"],
+            column_config=column_config,
+            use_container_width=True,
+        )
+
+    inputs: list[ScoreInput] = []
+    totals_by_label = {a.label: a for a in rec.assessments}
+
+    for record in _clean_records(edited):
+        label = str(record.get("Quotation"))
+        assessment = totals_by_label.get(label)
+        if assessment is None:
+            continue
+
+        cleaned: dict[str, int | None] = {}
+        for criterion in CRITERIA:
+            try:
+                cleaned[criterion] = validate_rating(record.get(criterion))
+            except ValueError as exc:
+                st.warning(f"{label}, {criterion}: {exc} It was ignored.")
+                cleaned[criterion] = None
+
+        notes = record.get("Evidence / notes")
+        store[label] = {
+            **cleaned,
+            "notes": "" if notes is None or notes != notes else str(notes),
+        }
+
+        inputs.append(ScoreInput(
+            label=label,
+            grand_total=assessment.grand_total,
+            eligible=assessment.eligible,
+            ratings=cleaned,
+        ))
+
+    price_weight = st.slider(
+        "How much should price count? The rest goes to service quality.",
+        min_value=0,
+        max_value=100,
+        value=70,
+        step=5,
+        format="%d%%",
+        key="score_price_weight",
+    )
+
+    scored = score_suppliers(inputs, price_weight)
+    ranked = [r for r in scored if r.rank is not None]
+
+    if not ranked:
+        st.info(
+            "Enter ratings for at least one eligible quotation to see a "
+            "weighted score."
+        )
+        return
+
+    leaders = [r.label for r in ranked if r.rank == 1]
+    price_leaders = [a.label for a in rec.assessments if a.rank == 1]
+
+    if len(leaders) > 1:
+        st.info(
+            f"With price at {price_weight}% and quality at "
+            f"{100 - price_weight}%, {', '.join(leaders)} are tied."
+        )
+    else:
+        message = (
+            f"With price at {price_weight}% and quality at "
+            f"{100 - price_weight}%, {leaders[0]} scores highest."
+        )
+        if leaders[0] not in price_leaders:
+            message += (
+                " Quality ratings change the result: on price alone the "
+                f"lowest total is {', '.join(price_leaders)}."
+            )
+        st.success(message)
+
+    def one_decimal(value: float | None) -> str:
+        return "" if value is None else f"{value:.1f}"
+
+    show_table([
+        {
+            "Rank": r.rank if r.rank is not None else "-",
+            "Quotation": r.label,
+            "Grand total": (
+                f"{r.grand_total:,.2f}" if r.grand_total is not None else ""
+            ),
+            "Price score": one_decimal(r.price_score),
+            "Average rating (of 5)": one_decimal(r.quality_average),
+            "Quality score": one_decimal(r.quality_score),
+            "Combined score": one_decimal(r.combined_score),
+            "Note": r.excluded_reason or "",
+        }
+        for r in scored
+    ])
+
+    ranges = winner_ranges(inputs)
+    if len(ranges) > 1:
+        parts = [
+            f"{start}% to {end}%: {', '.join(winners)}"
+            for start, end, winners in ranges
+        ]
+        st.caption(
+            "Who leads as the weight on quality rises (checked in 5% steps): "
+            + "; ".join(parts) + "."
+        )
+    elif ranges:
+        st.caption(
+            f"{', '.join(ranges[0][2])} leads at every weighting, so the "
+            "result does not depend on how you balance price and quality."
+        )
+
+    st.caption(
+        "Price score: the lowest eligible total scores 100 and others "
+        "score lowest divided by their total. Quality score: the average "
+        "rating mapped from 1-5 onto 0-100. Unrated or ineligible "
+        "quotations are not scored."
+    )
+
+
+def render_comparison(results: list[dict[str, Any]]) -> None:
+    st.subheader("Compare suppliers")
+
+    pool, skipped = build_comparison_pool(results)
+
+    for label in skipped:
+        st.warning(f"{label} could not be rebuilt for comparison.")
+
+    if len(pool) < 2:
+        st.info("At least two valid quotations are needed to compare.")
+        return
+
+    recommendation = render_recommendation(pool)
+
+    if recommendation is not None:
+        # Optional and collapsed: it needs ratings the app cannot get from
+        # the PDFs, so it should not take up space until the user wants it.
+        with st.expander("Optional: add your own service quality ratings"):
+            render_scorecard(recommendation)
+
+    st.markdown("**Totals stated by each supplier**")
+    totals_rows = []
+    for entry in pool:
+        totals = entry["data"].get("totals")
+        totals = totals if isinstance(totals, dict) else {}
+        totals_rows.append({
+            "Quotation": entry["label"],
+            "Subtotal": _text(totals.get("subtotal")),
+            "Tax rate (%)": _text(totals.get("tax_rate")),
+            "Tax total": _text(totals.get("tax_total")),
+            "Grand total": _text(totals.get("grand_total")),
+            "Validation": validation_dict(entry["data"]).get(
+                "status", "unknown"
+            ),
+        })
+    show_table(totals_rows)
+    st.caption(
+        "These are the totals printed on each quotation. What each one "
+        "includes can differ, for example delivery charged separately, so "
+        "compare scope before comparing totals."
+    )
+
+    st.markdown("**Closest matching items**")
+
+    if st.session_state.get("compare_base", 0) >= len(pool):
+        st.session_state["compare_base"] = 0
+
+    col_base, col_threshold = st.columns([2, 1])
+    base_index = col_base.selectbox(
+        "Base supplier",
+        list(range(len(pool))),
+        format_func=lambda i: pool[i]["label"],
+        key="compare_base",
+    )
+    threshold = col_threshold.slider(
+        "Minimum name similarity",
+        min_value=0.50,
+        max_value=0.95,
+        value=0.65,
+        step=0.05,
+        key="compare_threshold",
+    )
+
+    rows = build_comparison_rows(pool, base_index, threshold)
+
+    if rows:
+        show_table(rows)
+    else:
+        st.info("The base supplier has no line items to compare.")
+
+    st.caption(
+        "These are candidates only; no match is confirmed automatically. "
+        "Compare prices only where the basis column says the quantity and "
+        "unit are the same, and after checking discounts and tax treatment."
+    )
 
 
 # ---------------------------------------------------------
@@ -633,11 +1232,23 @@ def render_results(results: list[dict[str, Any]]) -> None:
                     st.subheader(f"{label}" + (f" · {name}" if name else ""))
 
                     unreadable = unreadable_chars_for(result, entry["page"])
-                    if unreadable:
+                    repair = entry.get("placeholder_repair")
+                    replaced = repair["replaced"] if repair else 0
+
+                    if unreadable and repair and replaced >= unreadable:
+                        st.info(
+                            "The PDF's font could not draw the currency "
+                            f"symbol (it appears as a box). It was treated "
+                            f"as {repair['currency']} because the page "
+                            f"states ({repair['currency']}) in its header. "
+                            "Verify against the PDF."
+                        )
+                    elif unreadable:
                         st.warning(
-                            f"This source page contains {unreadable} "
-                            "unreadable placeholder character(s), usually a "
-                            "currency symbol the PDF font could not draw. "
+                            f"This source page contains "
+                            f"{unreadable - replaced} unreadable placeholder "
+                            "character(s) that could not be resolved, "
+                            "usually a symbol the PDF font could not draw. "
                             "Check amounts and currency against the PDF."
                         )
 
@@ -669,12 +1280,7 @@ def render_results(results: list[dict[str, Any]]) -> None:
         )
 
     if len(all_quotations) >= 2:
-        st.info(
-            "Multiple quotations were processed. The next step is to match "
-            "equivalent items across suppliers. Do not compare line totals "
-            "until units, quantities, discounts and tax treatment are "
-            "checked."
-        )
+        render_comparison(results)
 
 
 # ---------------------------------------------------------
@@ -824,8 +1430,10 @@ for index, record in enumerate(uploaded_records):
             st.warning(
                 "Unreadable placeholder characters (such as a box) were "
                 f"found on page(s) {', '.join(map(str, affected))}. The PDF's "
-                "font is missing a symbol, often a currency sign. Check "
-                "amounts and currency on those pages against the PDF."
+                "font is missing a symbol, often a currency sign. If the "
+                "page header names one currency, such as 'Amount (INR)', "
+                "the box is treated as that currency and the notes say so. "
+                "Otherwise check amounts and currency against the PDF."
             )
 
         if preview["pages_with_text"] == 0:
