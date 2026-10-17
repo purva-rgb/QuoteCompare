@@ -78,6 +78,10 @@ def test_valid_arithmetic():
     item = make_item()
     item.tax_rate = Decimal("0")  # Explicitly known, for this test.
     quotation = make_quotation([item])
+    # The line states zero tax, so the quotation totals must state it too.
+    # Grand total is the fixture subtotal plus that known tax, not a guess.
+    quotation.totals.tax_total = Decimal("0")
+    quotation.totals.grand_total = quotation.totals.subtotal + Decimal("0")
 
     result = validate_quotation(quotation)
 

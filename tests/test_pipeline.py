@@ -16,6 +16,9 @@ from engine.schemas import (
 
 
 def sample_quotation():
+    # Line total is 10 × 500 = 5000, and the line states a zero tax rate.
+    subtotal = Decimal("5000")
+    tax_total = Decimal("0")
     return Quotation(
         vendor=Vendor(
             name="ABC Electricals",
@@ -31,11 +34,13 @@ def sample_quotation():
                 unit_price=Decimal("500"),
                 discount=Decimal("0"),
                 tax_rate=Decimal("0"),
-                line_total=Decimal("5000"),
+                line_total=subtotal,
             )
         ],
         totals=QuotationTotals(
-            subtotal=Decimal("5000"),
+            subtotal=subtotal,
+            tax_total=tax_total,
+            grand_total=subtotal + tax_total,
         ),
     )
 

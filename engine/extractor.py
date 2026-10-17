@@ -14,7 +14,8 @@ from typing import Any, Callable
 import requests
 from pydantic import ValidationError
 
-from engine.schemas import Quotation
+from engine.schemas import Quotation, TextQuality
+from engine.text_quality import assess_text
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +46,9 @@ OLLAMA_URL = os.getenv(
     "OLLAMA_URL", "http://127.0.0.1:11434"
 ).rstrip("/")
 
-# qwen2.5:3b was about 5x faster than qwen2.5:7b on a CPU-only machine.
-# Set the OLLAMA_MODEL environment variable to switch models.
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+# One setting for the local model. gemma3:4b and qwen3:4b are both
+# usable when installed. Override with OLLAMA_MODEL. Nothing is downloaded.
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
 
 # Seconds to wait without ANY output from the model (model loading plus
 # reading the page happen before the first output). Because responses are
@@ -84,7 +85,12 @@ OLLAMA_MAX_ATTEMPTS = max(1, _env_int("OLLAMA_MAX_ATTEMPTS", 2))
 # fewer tokens to generate, so pages finish faster. A field is only dropped
 # if the Quotation schema does not require it. Override with a
 # comma-separated OLLAMA_OMIT_FIELDS (set it empty to omit nothing).
-DEFAULT_OMITTED_FIELDS = ("validation", "match_status", "warnings")
+DEFAULT_OMITTED_FIELDS = (
+    "validation",
+    "match_status",
+    "warnings",
+    "text_quality",
+)
 
 # Currency codes recognised when a page states one in parentheses, such as
 # the column header "Amount (INR)".
@@ -94,7 +100,7 @@ KNOWN_CURRENCIES = {
 }
 _CODE_IN_PARENS = re.compile(r"\(([A-Z]{3})\)")
 
-EXTRACTOR_VERSION = "7"
+EXTRACTOR_VERSION = "8"
 
 
 SYSTEM_INSTRUCTIONS = """
@@ -243,7 +249,7 @@ def extraction_fingerprint() -> str:
 
 
 def normalize_model_name(name: str) -> str:
-    """Ollama treats 'qwen2.5' as 'qwen2.5:latest'; compare accordingly."""
+    """Ollama treats an untagged name as that name with ':latest'."""
     name = name.strip().lower()
     last_part = name.rsplit("/", 1)[-1]
     return name if ":" in last_part else f"{name}:latest"
@@ -632,6 +638,28 @@ def _apply_stated_facts(quotation: Quotation, pdf_text: str) -> None:
         )
 
 
+def _attach_text_quality(quotation: Quotation, pdf_text: str) -> None:
+    """Record glyph and currency evidence. Does not change any amount."""
+    assessment = assess_text(pdf_text)
+    quotation.text_quality = TextQuality.model_validate(assessment)
+
+    # A clean currency identification is stored on text_quality. A note is
+    # added only when the text itself needs a person to check it.
+    if assessment["suspicious_characters"] or (
+        assessment["currency_status"] == "unknown" and assessment["message"]
+    ):
+        quotation.extraction_notes.append(assessment["message"])
+
+    code = assessment["currency_code"]
+    if code and not quotation.vendor.currency:
+        quotation.vendor.currency = code
+        quotation.extraction_notes.append(
+            f"Currency {code} was taken from explicit text "
+            f"({assessment['currency_source'].replace('_', ' ')}). "
+            "It was not inferred from a missing glyph."
+        )
+
+
 def _build_quotation(result: dict[str, Any]) -> Quotation:
     """Parse and validate one model response. Raises ValueError."""
     content = result.get("response")
@@ -641,6 +669,8 @@ def _build_quotation(result: dict[str, Any]) -> Quotation:
 
     try:
         data = _clean_json_response(content)
+        # Diagnostics are filled from the source text, not from the model.
+        data.pop("text_quality", None)
 
         # Item IDs are assigned here, never taken from the model. Small
         # models reuse the wrong text as an ID (one run gave an item the
@@ -739,6 +769,7 @@ def extract_quotation(pdf_text: str) -> Quotation:
         quotation.extraction_notes.append(note)
 
         _apply_stated_facts(quotation, pdf_text)
+        _attach_text_quality(quotation, pdf_text)
 
         return quotation
 

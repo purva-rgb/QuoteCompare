@@ -67,6 +67,22 @@ class ValidationResult(StrictModel):
     issues: list[str] = Field(default_factory=list)
 
 
+class TextQuality(StrictModel):
+    """What the extractor could honestly tell about the source text.
+
+    `assessed` stays false until extraction inspects a real document.
+    Currency fields record evidence. They are not a guess, and they are
+    never written back over a number.
+    """
+
+    assessed: bool = False
+    suspicious_characters: int = Field(default=0, ge=0)
+    currency_status: Literal["identified", "unknown"] = "unknown"
+    currency_code: str | None = None
+    currency_source: Literal["stated_code", "stated_symbol", "none"] = "none"
+    message: str = ""
+
+
 class Quotation(StrictModel):
     vendor: Vendor
     items: list[QuotationItem] = Field(default_factory=list)
@@ -74,6 +90,7 @@ class Quotation(StrictModel):
     validation: ValidationResult = Field(
         default_factory=ValidationResult
     )
+    text_quality: TextQuality = Field(default_factory=TextQuality)
 
     # Keep the vendor's original stated totals separately if necessary.
     extraction_notes: list[str] = Field(default_factory=list)

@@ -226,15 +226,21 @@ def recommend(
         if currency is None:
             assessment.cautions.append("Currency is not stated.")
 
+        if quotation.validation.status == "needs_review":
+            for issue in quotation.validation.issues:
+                assessment.cautions.append(issue)
+
         if extra:
             assessment.cautions.append(
-                "Includes items the other quotations do not: "
+                "Includes items with no candidate match in the other "
+                "quotations (approximate, not a confirmed omission): "
                 + ", ".join(extra) + "."
             )
 
         if missing:
             assessment.cautions.append(
-                "Lacks items the other quotations have: "
+                "Lacks items with no candidate match in this quotation "
+                "(approximate, not a confirmed omission): "
                 + ", ".join(missing) + "."
             )
 
@@ -242,6 +248,9 @@ def recommend(
 
     notes = [
         "Ranking uses each quotation's stated grand total only.",
+        "The lowest total is not a judgement of best value.",
+        "Totals inside the configured tie band are not treated as "
+        "conclusively different.",
         "Scope differences are approximate until item matches are "
         "confirmed, so check them before relying on a ranking.",
     ]
@@ -315,12 +324,12 @@ def recommend(
     elif len(contenders) > 1:
         status = STATUS_EFFECTIVELY_TIED
         headline = (
-            f"{len(contenders)} quotations are within {margin}% of the "
-            "lowest total: "
+            f"{len(contenders)} quotations are within the configured "
+            f"{margin}% tie band of the lowest total: "
             + ", ".join(a.label for a in contenders)
             + f". {best.label} is lowest at "
-            f"{_amount(lowest, best.currency)}, but the difference is too "
-            "small to decide on. Compare scope and terms."
+            f"{_amount(lowest, best.currency)}. Totals inside this tie "
+            "band are not treated as conclusively different."
         )
     else:
         second = eligible[1]
@@ -330,8 +339,14 @@ def recommend(
             f"{_amount(lowest, best.currency)}. The next option, "
             f"{second.label}, is "
             f"{_amount(second.difference_from_lowest or Decimal('0'), best.currency)}"
-            f" ({second.percent_above_lowest}%) higher."
+            f" ({second.percent_above_lowest}%) higher. "
+            "The lowest total is not a judgement of best value."
         )
+        if any(a.extra_items or a.missing_items for a in assessments):
+            headline += (
+                " Unconfirmed scope differences are listed with each "
+                "quotation and could change the result."
+            )
 
     return Recommendation(
         status=status,

@@ -61,6 +61,27 @@ def normalize_unit(unit: str | None) -> str | None:
     return UNIT_ALIASES.get(key, unit.strip())
 
 
+# Whole-word wording variants only. Specifications, grades, and
+# dimensions are left in place.
+_EQUIVALENT_WORDING = (
+    (re.compile(r"\bset[\s-]+up\b"), "setup"),
+    (re.compile(r"\ba\s*/\s*v\b"), "audiovisual"),
+    (re.compile(r"\baudio\s*/\s*visual\b"), "audiovisual"),
+    (re.compile(r"\baudio\s+visual\b"), "audiovisual"),
+)
+
+
+def prepare_comparison_text(description: str) -> str:
+    """Case, spacing, and a few equivalent phrases. Specs stay intact."""
+    text = description.casefold().replace("&", " and ")
+    text = text.replace("×", " x ")
+    text = re.sub(r"[\t\r\n]+", " ", text)
+    for pattern, replacement in _EQUIVALENT_WORDING:
+        text = pattern.sub(replacement, text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def normalize_name(description: str) -> str:
     """
     Conservative text normalization.
@@ -68,11 +89,7 @@ def normalize_name(description: str) -> str:
     Do not remove grades, model numbers, dimensions or material
     names: those details may determine product equivalence.
     """
-    text = description.casefold()
-    text = text.replace("×", " x ")
-    text = re.sub(r"[\t\r\n]+", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    return prepare_comparison_text(description)
 
 
 def normalize_quotation(quotation: Quotation) -> Quotation:

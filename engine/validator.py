@@ -91,34 +91,70 @@ def validate_quotation(
                 f"{money(totals.subtotal)}."
             )
 
-    if totals.grand_total is not None and totals.subtotal is None:
+    if totals.subtotal is None and totals.grand_total is not None:
         issues.append(
             "Grand total is present, but subtotal is unknown."
         )
+    elif totals.subtotal is None and totals.tax_total is not None:
+        issues.append(
+            "Tax total is present, but subtotal is unknown."
+        )
+    elif totals.subtotal is None:
+        issues.append("Subtotal is unknown.")
 
-    # A quotation that states a subtotal but yields no tax total or grand
-    # total is an incomplete extraction, not a valid one.
-    if totals.subtotal is not None:
-        if totals.tax_total is None:
-            issues.append("Tax total is unknown.")
+    # Missing money fields stay missing. A diagnostic figure, when one
+    # can be computed from stated inputs, is labelled and not stored.
+    if totals.tax_total is None:
+        issues.append("Tax total is unknown.")
+        if bill_tax_rate is not None and totals.subtotal is not None:
+            expected_tax = money(
+                totals.subtotal * bill_tax_rate / Decimal("100")
+            )
+            issues.append(
+                f"Diagnostic only: a tax rate of {bill_tax_rate}% on the "
+                f"stated subtotal would be {expected_tax}. This is not a "
+                "supplier-stated tax total."
+            )
 
-        if totals.grand_total is None:
-            issues.append("Grand total is unknown.")
+    if totals.grand_total is None:
+        issues.append("Grand total is unknown.")
+        if (
+            totals.subtotal is not None
+            and totals.tax_total is not None
+        ):
+            expected_grand = money(totals.subtotal) + money(totals.tax_total)
+            issues.append(
+                "Diagnostic only: the stated subtotal plus the stated "
+                f"tax total is {expected_grand}. This is not a "
+                "supplier-stated grand total."
+            )
 
     # Consistency checks between figures the vendor stated. These flag
     # differences for review; they never replace a stated value.
+    rate_for_check = bill_tax_rate
+    if rate_for_check is None:
+        line_rates = {
+            item.tax_rate
+            for item in quotation.items
+            if item.tax_rate is not None
+        }
+        if len(line_rates) == 1 and all(
+            item.tax_rate is not None for item in quotation.items
+        ):
+            rate_for_check = next(iter(line_rates))
+
     if (
-        bill_tax_rate is not None
+        rate_for_check is not None
         and totals.subtotal is not None
         and totals.tax_total is not None
     ):
         expected_tax = money(
-            totals.subtotal * bill_tax_rate / Decimal("100")
+            totals.subtotal * rate_for_check / Decimal("100")
         )
 
         if abs(expected_tax - money(totals.tax_total)) > tolerance:
             issues.append(
-                f"A tax rate of {bill_tax_rate}% on the subtotal gives "
+                f"A tax rate of {rate_for_check}% on the subtotal gives "
                 f"{expected_tax}, but the stated tax total is "
                 f"{money(totals.tax_total)}. Other charges or taxable-"
                 "amount rules may explain the difference."
@@ -137,6 +173,35 @@ def validate_quotation(
                 f"stated grand total is {money(totals.grand_total)}. "
                 "Freight, rounding or other charges may explain the "
                 "difference."
+            )
+
+    quality = quotation.text_quality
+    if quality.assessed and quality.suspicious_characters:
+        issues.append(
+            "Extraction uncertainty: "
+            f"{quality.suspicious_characters} unreadable character(s) "
+            "were left unchanged. Verify amounts and currency against "
+            "the PDF. This is not an arithmetic error."
+        )
+
+    stated_currency = (quotation.vendor.currency or "").strip().upper()
+    if quality.assessed and stated_currency:
+        if (
+            quality.currency_status == "identified"
+            and quality.currency_code
+            and stated_currency != quality.currency_code
+        ):
+            issues.append(
+                "Extraction uncertainty: currency "
+                f"{quotation.vendor.currency} does not match "
+                f"{quality.currency_code}, which is stated in the text."
+            )
+        elif quality.currency_status == "unknown":
+            issues.append(
+                "Extraction uncertainty: currency "
+                f"{quotation.vendor.currency} was not confirmed by an "
+                "explicit code or unambiguous symbol in the text. "
+                "Verify it manually."
             )
 
     if not issues and not has_error:
