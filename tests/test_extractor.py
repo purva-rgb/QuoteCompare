@@ -1,7 +1,16 @@
 from decimal import Decimal
 
-from engine.extractor import _apply_stated_facts
+import pytest
+import requests
+
+from engine.extractor import (
+    _apply_stated_facts,
+    _attach_text_quality,
+    _build_quotation,
+    check_ollama,
+)
 from engine.schemas import Quotation, QuotationItem, QuotationTotals, Vendor
+from engine.validator import validate_quotation
 
 PAGE = """Supplier quotation Page 1
 QUOTATION
@@ -157,3 +166,104 @@ def test_table_layout_with_labels_and_values_on_separate_lines():
     assert quotation.totals.tax_total == Decimal("32760.00")
     assert quotation.totals.grand_total == Decimal("214760.00")
     assert quotation.totals.tax_rate == Decimal("18")
+
+
+def test_malformed_model_json_is_rejected():
+    with pytest.raises(ValueError):
+        _build_quotation({"response": "not json"})
+
+
+def test_empty_model_response_is_rejected():
+    with pytest.raises(ValueError):
+        _build_quotation({"response": "   "})
+
+
+def test_unreadable_glyph_is_not_rewritten_as_currency():
+    quotation = make()
+    text = "Amount (INR)\nTotal \u25a0 10"
+
+    _attach_text_quality(quotation, text)
+
+    assert "\u25a0" in text
+    assert quotation.vendor.currency == "INR"
+    assert quotation.text_quality.suspicious_characters == 1
+    assert quotation.totals.grand_total is None
+
+
+def test_unconfirmed_currency_stays_a_review_item():
+    quotation = make(
+        subtotal=Decimal("10"),
+        tax_total=Decimal("0"),
+        grand_total=Decimal("10"),
+        tax_rate=Decimal("0"),
+    )
+    quotation.items[0].quantity = Decimal("1")
+    quotation.items[0].unit_price = Decimal("10")
+    quotation.items[0].line_total = Decimal("10")
+    quotation.items[0].tax_rate = Decimal("0")
+    quotation.vendor.currency = "INR"
+
+    _attach_text_quality(quotation, "Catering 10")
+    result = validate_quotation(quotation)
+
+    assert quotation.totals.grand_total == Decimal("10")
+    assert quotation.totals.tax_total == Decimal("0")
+    assert any("was not confirmed" in issue for issue in result.issues)
+
+
+def test_configured_model_is_accepted_when_installed(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"models": [{"name": "qwen3:4b"}, {"name": "gemma3:4b"}]}
+
+    monkeypatch.setattr("engine.extractor.OLLAMA_MODEL", "gemma3:4b")
+    monkeypatch.setattr(
+        "engine.extractor.requests.get",
+        lambda *args, **kwargs: Response(),
+    )
+
+    ok, message = check_ollama()
+
+    assert ok is True
+    assert "gemma3:4b" in message
+
+
+def test_missing_model_is_reported_and_not_downloaded(monkeypatch):
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"models": [{"name": "qwen3:4b"}]}
+
+    def fake_get(url, timeout=3):
+        calls.append(url)
+        return Response()
+
+    monkeypatch.setattr("engine.extractor.OLLAMA_MODEL", "gemma3:4b")
+    monkeypatch.setattr("engine.extractor.requests.get", fake_get)
+
+    ok, message = check_ollama()
+
+    assert ok is False
+    assert "gemma3:4b" in message
+    assert "qwen3:4b" in message
+    assert calls
+    assert all(call.endswith("/api/tags") for call in calls)
+
+
+def test_ollama_connection_error_is_reported(monkeypatch):
+    def boom(*args, **kwargs):
+        raise requests.ConnectionError("down")
+
+    monkeypatch.setattr("engine.extractor.requests.get", boom)
+
+    ok, message = check_ollama()
+
+    assert ok is False
+    assert "Cannot reach Ollama" in message

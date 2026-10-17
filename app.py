@@ -5,7 +5,6 @@ import hashlib
 import io
 import json
 import logging
-import re
 import time
 from datetime import datetime
 from typing import Any, Callable
@@ -26,7 +25,9 @@ from engine.pipeline import (
     QuotationProcessingError,
     process_quotation_text,
 )
+from engine.text_quality import diagnose_page, font_currency_hints
 from engine.recommender import (
+    STATUS_EFFECTIVELY_TIED,
     STATUS_NONE,
     STATUS_SINGLE_ELIGIBLE,
     QuotationEntry,
@@ -55,21 +56,6 @@ MAX_TEXT_CHARS = 60_000          # whole-PDF mode limit
 MAX_PAGE_TEXT_CHARS = 20_000     # per-page limit
 MIN_PAGE_CHARS = 30              # below this a page is treated as blank
 
-# Characters PDFs draw when a font lacks a glyph (for example a rupee sign).
-# Amounts and currency near them cannot be trusted without checking the PDF.
-PLACEHOLDER_CHARS = "\u25a0\u25a1\u25af\ufffd"
-
-# A placeholder directly before a number is treated as the currency sign,
-# but only when the page names exactly one currency code in parentheses,
-# for example the column header "Amount (INR)".
-CURRENCY_CODES = {
-    "INR", "USD", "EUR", "GBP", "AED", "SGD", "AUD", "CAD",
-    "JPY", "CNY", "CHF", "NZD", "ZAR",
-}
-_CODE_IN_PARENS = re.compile(r"\(([A-Z]{3})\)")
-_PLACEHOLDER_BEFORE_NUMBER = re.compile(
-    "[" + re.escape(PLACEHOLDER_CHARS) + r"]\s?(?=\d)"
-)
 MAX_CONSECUTIVE_FAILURES = 2     # stop a file early if the model keeps failing
 
 # Model, URL and timeout come from engine/extractor.py so the app
@@ -158,53 +144,6 @@ def get_issues(validation: dict[str, Any]) -> list[str]:
     return [str(issues)]
 
 
-def count_placeholders(text: str) -> int:
-    """Count characters that stand in for a glyph the PDF font lacked."""
-    return sum(text.count(ch) for ch in PLACEHOLDER_CHARS)
-
-
-def repair_currency_placeholders(
-    text: str,
-) -> tuple[str, dict[str, Any] | None]:
-    """
-    Replace placeholder boxes that sit directly before numbers with the
-    currency code the page itself states (for example "Amount (INR)").
-
-    Nothing is changed unless the page names exactly one known currency
-    code. Returns the text and, when a repair was made, a description of it
-    so the app can tell the user.
-    """
-    codes = {
-        code for code in _CODE_IN_PARENS.findall(text)
-        if code in CURRENCY_CODES
-    }
-
-    if len(codes) != 1:
-        return text, None
-
-    code = next(iter(codes))
-    repaired, count = _PLACEHOLDER_BEFORE_NUMBER.subn(f"{code} ", text)
-
-    if count == 0:
-        return text, None
-
-    return repaired, {"currency": code, "replaced": count}
-
-
-def unreadable_chars_for(result: dict[str, Any], page: int | None) -> int:
-    """Placeholder-character count for one page, or the whole PDF."""
-    info = result.get("pdf_result") or {}
-    diagnostics = info.get("page_diagnostics") or []
-
-    if page is None:
-        return sum(d.get("unreadable_chars", 0) for d in diagnostics)
-
-    if 1 <= page <= len(diagnostics):
-        return int(diagnostics[page - 1].get("unreadable_chars", 0))
-
-    return 0
-
-
 def safe_stem(filename: str) -> str:
     stem = filename.rsplit(".", 1)[0]
     cleaned = "".join(c if c.isalnum() or c in "-_ " else "_" for c in stem)
@@ -276,12 +215,13 @@ def read_pdf(file_bytes: bytes) -> dict[str, Any]:
             text = ""
 
         page_texts.append(text)
-        diagnostics.append({
-            "page": page_number,
-            "characters": len(text),
-            "has_text": len(text) >= MIN_PAGE_CHARS,
-            "unreadable_chars": count_placeholders(text),
-        })
+        diagnostic = diagnose_page(
+            page_number,
+            text,
+            font_currency_hints(page),
+        )
+        diagnostic["has_text"] = len(text) >= MIN_PAGE_CHARS
+        diagnostics.append(diagnostic)
 
     combined = "\n\n".join(
         f"--- Page {i} ---\n{t}"
@@ -289,12 +229,19 @@ def read_pdf(file_bytes: bytes) -> dict[str, Any]:
         if t
     ).strip()
 
+    hints: list[str] = []
+    for diagnostic in diagnostics:
+        for hint in diagnostic.get("font_hints") or []:
+            if hint not in hints:
+                hints.append(hint)
+
     return {
         "text": combined,
         "page_texts": page_texts,
         "page_count": page_count,
         "pages_with_text": sum(d["has_text"] for d in diagnostics),
         "page_diagnostics": diagnostics,
+        "document_diagnostics": diagnose_page(None, combined, hints),
     }
 
 
@@ -308,10 +255,7 @@ def read_pdf_cached(file_hash: str, _file_bytes: bytes) -> dict[str, Any]:
 # Processing
 # ---------------------------------------------------------
 
-def run_pipeline_cached(
-    text: str,
-    repair: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], bool]:
+def run_pipeline_cached(text: str) -> tuple[dict[str, Any], bool]:
     """Run the pipeline on one text block. Returns (data, was_cached)."""
     cache: dict[str, dict[str, Any]] = st.session_state.setdefault(
         PAGE_CACHE_KEY, {}
@@ -331,19 +275,6 @@ def run_pipeline_cached(
         raise QuotationProcessingError(
             "The pipeline returned an unexpected result type."
         )
-
-    if repair:
-        note = (
-            "The PDF's font could not draw the currency symbol (it appears "
-            f"as a box). It was treated as {repair['currency']} because the "
-            f"page states ({repair['currency']}) in its header. "
-            "Verify against the source PDF."
-        )
-        notes = data.get("extraction_notes")
-        if isinstance(notes, list):
-            notes.append(note)
-        else:
-            data["extraction_notes"] = [note]
 
     cache[key] = data
     while len(cache) > MAX_CACHED_PAGES:
@@ -397,13 +328,17 @@ def process_one_file(
     if pdf_result["pages_with_text"] == 0:
         return finish(
             error=(
-                "No readable text was found. "
-                "This may be a scanned PDF and require local OCR."
+                "No usable text was extracted. This PDF may be image-only. "
+                "OCR was not run."
             )
         )
 
-    # Build the list of (page_number_or_None, text) jobs.
-    jobs: list[tuple[int | None, str, dict[str, Any] | None]] = []
+    diagnostics_by_page = {
+        d["page"]: d for d in pdf_result["page_diagnostics"]
+    }
+    # Original page text is sent through unchanged. Unreadable glyphs are
+    # reported, not replaced with a currency symbol.
+    jobs: list[tuple[int | None, str]] = []
 
     if mode == MODE_WHOLE:
         text = pdf_result["text"]
@@ -415,8 +350,7 @@ def process_one_file(
                     "Switch to per-page mode or split the PDF."
                 )
             )
-        repaired, repair = repair_currency_placeholders(text)
-        jobs.append((None, repaired, repair))
+        jobs.append((None, text))
     else:
         for page_number, text in enumerate(pdf_result["page_texts"], start=1):
             if len(text) < MIN_PAGE_CHARS:
@@ -432,8 +366,7 @@ def process_one_file(
                     ),
                 })
             else:
-                repaired, repair = repair_currency_placeholders(text)
-                jobs.append((page_number, repaired, repair))
+                jobs.append((page_number, text))
 
     if not jobs and not base["page_errors"]:
         return finish(error="No pages contained enough text to process.")
@@ -441,7 +374,7 @@ def process_one_file(
     consecutive_failures = 0
     total = max(len(jobs), 1)
 
-    for position, (page_number, text, repair) in enumerate(jobs):
+    for position, (page_number, text) in enumerate(jobs):
         label = (
             f"page {page_number}" if page_number is not None else "whole PDF"
         )
@@ -459,11 +392,16 @@ def process_one_file(
         report(f"{filename}: processing {label}", position / total)
 
         try:
-            data, _was_cached = run_pipeline_cached(text, repair)
+            data, _was_cached = run_pipeline_cached(text)
+            if page_number is None:
+                text_diagnostics = pdf_result.get("document_diagnostics")
+            else:
+                text_diagnostics = diagnostics_by_page.get(page_number)
             base["quotations"].append({
                 "page": page_number,
                 "data": data,
-                "placeholder_repair": repair,
+                "source_text": text,
+                "text_diagnostics": text_diagnostics,
             })
             consecutive_failures = 0
 
@@ -522,6 +460,7 @@ def build_export(results: list[dict[str, Any]]) -> dict[str, Any]:
 def build_line_items_csv(results: list[dict[str, Any]]) -> str:
     columns = [
         "file", "page", "supplier", "quotation_number", "quotation_date",
+        "currency", "currency_status", "validation_status",
         "item_id", "description", "normalized_name", "quantity", "unit",
         "unit_price", "discount", "tax_rate", "line_total",
         "match_status", "warnings",
@@ -537,6 +476,11 @@ def build_line_items_csv(results: list[dict[str, Any]]) -> str:
             if not isinstance(vendor, dict):
                 vendor = {}
 
+            quality = data.get("text_quality") or {}
+            if not isinstance(quality, dict):
+                quality = {}
+            validation_status = validation_dict(data).get("status")
+
             for item in data.get("items") or []:
                 if not isinstance(item, dict):
                     continue
@@ -546,15 +490,19 @@ def build_line_items_csv(results: list[dict[str, Any]]) -> str:
                     "supplier": vendor.get("name"),
                     "quotation_number": vendor.get("quotation_number"),
                     "quotation_date": vendor.get("quotation_date"),
+                    "currency": _csv_cell(vendor.get("currency")),
+                    "currency_status": quality.get("currency_status")
+                    or "unknown",
+                    "validation_status": validation_status or "unknown",
                     "item_id": item.get("item_id"),
                     "description": item.get("original_description"),
                     "normalized_name": item.get("normalized_name"),
-                    "quantity": item.get("quantity"),
-                    "unit": item.get("unit"),
-                    "unit_price": item.get("unit_price"),
-                    "discount": item.get("discount"),
-                    "tax_rate": item.get("tax_rate"),
-                    "line_total": item.get("line_total"),
+                    "quantity": _csv_cell(item.get("quantity")),
+                    "unit": _csv_cell(item.get("unit")),
+                    "unit_price": _csv_cell(item.get("unit_price")),
+                    "discount": _csv_cell(item.get("discount")),
+                    "tax_rate": _csv_cell(item.get("tax_rate")),
+                    "line_total": _csv_cell(item.get("line_total")),
                     "match_status": item.get("match_status"),
                     "warnings": "; ".join(
                         str(w) for w in (item.get("warnings") or [])
@@ -569,14 +517,27 @@ def build_line_items_csv(results: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------
 
 STATUS_TEXT = {
-    "candidate_strong": "Strong candidate",
-    "candidate_possible": "Possible candidate",
-    "needs_review": "Needs review (specification conflict)",
+    "candidate_strong": "Strong candidate — not confirmed",
+    "candidate_possible": "Possible match — manual review",
+    "needs_review": "Needs review",
 }
 
 
 def _text(value: Any) -> str:
     return "" if value is None else str(value)
+
+
+def _shown(value: Any) -> str:
+    """Show a missing extracted value as unknown, never as zero."""
+    if value is None:
+        return "Unknown"
+    if isinstance(value, str) and not value.strip():
+        return "Unknown"
+    return str(value)
+
+
+def _csv_cell(value: Any) -> Any:
+    return "unknown" if value is None else value
 
 
 def _qty_unit(item: dict[str, Any] | None) -> str:
@@ -681,6 +642,7 @@ def build_comparison_rows(
                 continue
 
             row: dict[str, Any] = {
+                "Base supplier": base["label"],
                 "Base item": item.original_description,
                 "Compared supplier": other["label"],
             }
@@ -712,25 +674,36 @@ def build_comparison_rows(
                 str(best["candidate_item_id"])
             )
 
+            comparable = bool(best.get("prices_comparable"))
+            reasons = "; ".join(best.get("review_reasons") or [])
             row.update({
                 "Closest item": _text(
                     (other_dict or {}).get("original_description")
                 ),
                 "Name similarity": best["similarity"],
                 "Status": STATUS_TEXT.get(best["status"], best["status"]),
+                "Why it needs review": reasons,
                 "Specification conflicts": ", ".join(
                     best["conflicting_specifications"]
                 ),
                 "Basis": _same_basis(base_dict, other_dict),
-                "Base qty / unit": _qty_unit(base_dict),
-                "Their qty / unit": _qty_unit(other_dict),
-                "Base unit price": _text((base_dict or {}).get("unit_price")),
-                "Their unit price": _text(
-                    (other_dict or {}).get("unit_price")
+                "Base qty / unit": _qty_unit(base_dict) or "Unknown",
+                "Their qty / unit": _qty_unit(other_dict) or "Unknown",
+                "Base unit price": (
+                    _shown((base_dict or {}).get("unit_price"))
+                    if comparable else "Not comparable"
                 ),
-                "Base line total": _text((base_dict or {}).get("line_total")),
-                "Their line total": _text(
-                    (other_dict or {}).get("line_total")
+                "Their unit price": (
+                    _shown((other_dict or {}).get("unit_price"))
+                    if comparable else "Not comparable"
+                ),
+                "Base line total": (
+                    _shown((base_dict or {}).get("line_total"))
+                    if comparable else "Not comparable"
+                ),
+                "Their line total": (
+                    _shown((other_dict or {}).get("line_total"))
+                    if comparable else "Not comparable"
                 ),
             })
             rows.append(row)
@@ -797,10 +770,16 @@ def render_recommendation(
         st.error("The recommendation could not be calculated. See the terminal.")
         return None
 
+    uncertain = any(
+        a.cautions or a.extra_items or a.missing_items
+        for a in rec.assessments
+    )
     if rec.status == STATUS_NONE:
         st.warning(rec.headline)
-    elif rec.status == STATUS_SINGLE_ELIGIBLE:
+    elif rec.status in (STATUS_SINGLE_ELIGIBLE, STATUS_EFFECTIVELY_TIED):
         st.info(rec.headline)
+    elif uncertain:
+        st.warning(rec.headline)
     else:
         st.success(rec.headline)
 
@@ -1031,20 +1010,28 @@ def render_comparison(results: list[dict[str, Any]]) -> None:
     for entry in pool:
         totals = entry["data"].get("totals")
         totals = totals if isinstance(totals, dict) else {}
+        quality = entry["data"].get("text_quality") or {}
+        if not isinstance(quality, dict):
+            quality = {}
+        vendor = entry["data"].get("vendor") or {}
+        if not isinstance(vendor, dict):
+            vendor = {}
         totals_rows.append({
             "Quotation": entry["label"],
-            "Subtotal": _text(totals.get("subtotal")),
-            "Tax rate (%)": _text(totals.get("tax_rate")),
-            "Tax total": _text(totals.get("tax_total")),
-            "Grand total": _text(totals.get("grand_total")),
+            "Subtotal": _shown(totals.get("subtotal")),
+            "Tax rate (%)": _shown(totals.get("tax_rate")),
+            "Tax total": _shown(totals.get("tax_total")),
+            "Grand total": _shown(totals.get("grand_total")),
+            "Currency": _shown(vendor.get("currency")),
+            "Currency evidence": quality.get("currency_status") or "unknown",
             "Validation": validation_dict(entry["data"]).get(
                 "status", "unknown"
             ),
         })
     show_table(totals_rows)
     st.caption(
-        "These are the totals printed on each quotation. What each one "
-        "includes can differ, for example delivery charged separately, so "
+        "These are the totals printed on each quotation. Unknown means the "
+        "value was not extracted. What each total includes can differ, so "
         "compare scope before comparing totals."
     )
 
@@ -1078,8 +1065,8 @@ def render_comparison(results: list[dict[str, Any]]) -> None:
 
     st.caption(
         "These are candidates only; no match is confirmed automatically. "
-        "Compare prices only where the basis column says the quantity and "
-        "unit are the same, and after checking discounts and tax treatment."
+        "Unit prices and line totals are shown only when the quantity and "
+        "unit match. Not comparable means the price gap should not be used."
     )
 
 
@@ -1108,6 +1095,26 @@ def render_quotation(data: dict[str, Any], key_prefix: str, filename: str,
         f"**Date:** {vendor.get('quotation_date') or 'Not available'}"
     )
 
+    quality = data.get("text_quality") or {}
+    if not isinstance(quality, dict):
+        quality = {}
+    currency_status = quality.get("currency_status") or "unknown"
+    currency_code = quality.get("currency_code")
+    if currency_status == "identified" and currency_code:
+        source = quality.get("currency_source") or "the document"
+        currency_line = (
+            f"Identified as {currency_code} from {str(source).replace('_', ' ')}."
+        )
+    else:
+        currency_line = (
+            "Unknown. No explicit currency code or unambiguous symbol "
+            "was found."
+        )
+    stated = vendor.get("currency")
+    st.write(
+        f"**Currency field:** {_shown(stated)}. **Evidence:** {currency_line}"
+    )
+
     st.markdown("**Line items**")
     if items:
         show_table([
@@ -1115,12 +1122,12 @@ def render_quotation(data: dict[str, Any], key_prefix: str, filename: str,
                 "Item ID": item.get("item_id"),
                 "Description": item.get("original_description"),
                 "Normalized name": item.get("normalized_name"),
-                "Quantity": item.get("quantity"),
-                "Unit": item.get("unit"),
-                "Unit price": item.get("unit_price"),
-                "Discount": item.get("discount"),
-                "Tax rate": item.get("tax_rate"),
-                "Line total": item.get("line_total"),
+                "Quantity": _shown(item.get("quantity")),
+                "Unit": _shown(item.get("unit")),
+                "Unit price": _shown(item.get("unit_price")),
+                "Discount": _shown(item.get("discount")),
+                "Tax rate": _shown(item.get("tax_rate")),
+                "Line total": _shown(item.get("line_total")),
                 "Match status": item.get("match_status"),
                 "Warnings": "; ".join(
                     str(w) for w in (item.get("warnings") or [])
@@ -1132,26 +1139,53 @@ def render_quotation(data: dict[str, Any], key_prefix: str, filename: str,
     else:
         st.warning("No line items were extracted.")
 
-    st.markdown("**Totals**")
+    st.markdown("**Supplier-stated totals**")
+    st.caption(
+        "These are the amounts printed on the quotation. Unknown is not zero."
+    )
     if isinstance(totals, dict) and totals:
-        st.json(totals)
+        show_table([{
+            "Subtotal": _shown(totals.get("subtotal")),
+            "Tax rate (%)": _shown(totals.get("tax_rate")),
+            "Tax total": _shown(totals.get("tax_total")),
+            "Grand total": _shown(totals.get("grand_total")),
+        }])
     else:
         st.write("No totals were extracted.")
+
+    extraction_issues = [
+        issue for issue in issues if issue.startswith("Extraction uncertainty")
+    ]
+    diagnostic_issues = [
+        issue for issue in issues if issue.startswith("Diagnostic only")
+    ]
+    review_issues = [
+        issue for issue in issues
+        if issue not in extraction_issues and issue not in diagnostic_issues
+    ]
 
     st.markdown("**Validation**")
     status = validation.get("status", "unknown")
     st.write(f"Status: `{status}`")
 
-    if issues:
-        for issue in issues:
-            st.warning(issue)
-    elif status == "valid":
+    if review_issues:
+        st.warning("\n\n".join(f"- {issue}" for issue in review_issues))
+    elif status == "valid" and not extraction_issues:
         st.success("No validation issues were reported.")
-    else:
+    elif not review_issues and not extraction_issues:
         st.info(
             "No issue list was returned. Review the quotation against "
             "the original PDF."
         )
+
+    if extraction_issues:
+        st.markdown("**Extraction uncertainty**")
+        st.info("\n\n".join(f"- {issue}" for issue in extraction_issues))
+
+    if diagnostic_issues:
+        st.markdown("**Diagnostic calculations**")
+        st.caption("These figures were not printed on the quotation.")
+        st.info("\n\n".join(f"- {issue}" for issue in diagnostic_issues))
 
     notes = data.get("extraction_notes")
     if notes:
@@ -1231,26 +1265,26 @@ def render_results(results: list[dict[str, Any]]) -> None:
                 with st.container(border=True):
                     st.subheader(f"{label}" + (f" · {name}" if name else ""))
 
-                    unreadable = unreadable_chars_for(result, entry["page"])
-                    repair = entry.get("placeholder_repair")
-                    replaced = repair["replaced"] if repair else 0
-
-                    if unreadable and repair and replaced >= unreadable:
-                        st.info(
-                            "The PDF's font could not draw the currency "
-                            f"symbol (it appears as a box). It was treated "
-                            f"as {repair['currency']} because the page "
-                            f"states ({repair['currency']}) in its header. "
-                            "Verify against the PDF."
-                        )
-                    elif unreadable:
+                    diagnostic = entry.get("text_diagnostics") or {}
+                    unreadable = int(diagnostic.get("unreadable_chars") or 0)
+                    if unreadable:
                         st.warning(
-                            f"This source page contains "
-                            f"{unreadable - replaced} unreadable placeholder "
-                            "character(s) that could not be resolved, "
-                            "usually a symbol the PDF font could not draw. "
-                            "Check amounts and currency against the PDF."
+                            diagnostic.get("message")
+                            or (
+                                f"This page contains {unreadable} unreadable "
+                                "character(s). The original text was kept. "
+                                "Verify amounts and currency against the PDF."
+                            )
                         )
+
+                    source_text = entry.get("source_text")
+                    if source_text:
+                        with st.expander("Original extracted text"):
+                            st.text(source_text)
+                            st.caption(
+                                "This is the text taken from the PDF. "
+                                "Unreadable characters were not replaced."
+                            )
 
                     render_quotation(
                         entry["data"],
@@ -1427,17 +1461,25 @@ for index, record in enumerate(uploaded_records):
             if d.get("unreadable_chars")
         ]
         if affected:
+            details = []
+            for diagnostic in preview["page_diagnostics"]:
+                if diagnostic.get("unreadable_chars"):
+                    details.append(
+                        diagnostic.get("message")
+                        or f"Page {diagnostic['page']} has unreadable characters."
+                    )
             st.warning(
-                "Unreadable placeholder characters (such as a box) were "
-                f"found on page(s) {', '.join(map(str, affected))}. The PDF's "
-                "font is missing a symbol, often a currency sign. If the "
-                "page header names one currency, such as 'Amount (INR)', "
-                "the box is treated as that currency and the notes say so. "
-                "Otherwise check amounts and currency against the PDF."
+                "Unreadable characters were found on page(s) "
+                f"{', '.join(map(str, affected))}. The original text is "
+                "kept. A box is not replaced with a currency symbol.\n\n"
+                + "\n\n".join(details)
             )
 
         if preview["pages_with_text"] == 0:
-            st.warning("No selectable text found. Local OCR is needed.")
+            st.warning(
+                "No usable text was found. This PDF may be image-only. "
+                "OCR was not run."
+            )
             continue
 
         if mode == MODE_PER_PAGE:
@@ -1447,10 +1489,14 @@ for index, record in enumerate(uploaded_records):
             )
 
         st.text_area(
-            "Extracted PDF text",
+            "Original extracted text",
             preview["text"],
             height=220,
             key=f"preview_{index}_{record['hash']}",
+        )
+        st.caption(
+            "Original text from the PDF, shown beside any currency "
+            "evidence in the page diagnostics. The text is not rewritten."
         )
         st.caption("Page extraction diagnostics")
         show_table(preview["page_diagnostics"])
