@@ -114,6 +114,7 @@ def _background_data_uri() -> str | None:
         "quotecompare_background.jpg",
         "quotecompare_background.jpeg",
         "quotecompare_background.png",
+        "image.png",
     ):
         path = root / name
         try:
@@ -128,36 +129,27 @@ def _background_data_uri() -> str | None:
     return None
 
 
+def _page_background() -> str:
+    """Photograph for every screen. A gradient is used only if the file is missing."""
+    image = _background_data_uri()
+    if image:
+        return (
+            "linear-gradient(180deg, rgba(8, 14, 26, 0.55) 0%, "
+            "rgba(8, 14, 26, 0.72) 100%), "
+            f"url('{image}') center center / cover no-repeat fixed"
+        )
+    return (
+        "radial-gradient(900px 420px at 12% 0%, "
+        "rgba(198, 161, 91, 0.22), transparent 60%), "
+        "linear-gradient(165deg, #0b1220 0%, #17263d 52%, #0d1728 100%)"
+    )
+
+
 def _apply_theme(hero: bool) -> None:
-    """Dark event photograph for the opening screen. A light page for results."""
-    image = _background_data_uri() if hero else None
-    if hero and image:
-        background = (
-            "linear-gradient(180deg, rgba(8, 14, 26, 0.58) 0%, "
-            "rgba(8, 14, 26, 0.82) 100%), "
-            f"url('{image}') center / cover no-repeat fixed"
-        )
-    elif hero:
-        background = (
-            "radial-gradient(900px 420px at 12% 0%, "
-            "rgba(198, 161, 91, 0.22), transparent 60%), "
-            "linear-gradient(165deg, #0b1220 0%, #17263d 52%, #0d1728 100%)"
-        )
-    else:
-        background = "#f4f6f8"
+    """Same photograph on the opening screen and after every results rerun."""
+    background = _page_background()
 
     hero_text = """
-    [data-testid="stSidebar"] {
-        background: rgba(9, 14, 24, 0.94);
-    }
-    [data-testid="stSidebar"] p,
-    [data-testid="stSidebar"] label,
-    [data-testid="stSidebar"] span,
-    [data-testid="stSidebar"] h1,
-    [data-testid="stSidebar"] h2,
-    [data-testid="stSidebar"] h3 {
-        color: #e7edf6;
-    }
     .qc-brand {
         letter-spacing: 0.28em;
         color: #c6a15b;
@@ -192,50 +184,91 @@ def _apply_theme(hero: bool) -> None:
     .st-key-hero_panel span {
         color: #f4efe6;
     }
-    """ if hero else """
-    .st-key-best_pick {
-        background: #ffffff;
-        border: 1px solid #d9e0ea;
-        border-top: 4px solid #c6a15b;
-        border-radius: 14px;
-        padding: 0.35rem 0.85rem 0.15rem;
-    }
-    """
-
-    # Explicitly set readable foreground colors on the light results page.
-    # Some browser/Streamlit themes otherwise inherit near-white text on white.
-    if not hero:
-        hero_text += """
-        [data-testid="stAppViewContainer"],
-        [data-testid="stAppViewContainer"] p,
-        [data-testid="stAppViewContainer"] label,
-        [data-testid="stAppViewContainer"] span,
-        [data-testid="stAppViewContainer"] h1,
-        [data-testid="stAppViewContainer"] h2,
-        [data-testid="stAppViewContainer"] h3,
-        [data-testid="stAppViewContainer"] h4,
-        [data-testid="stAppViewContainer"] li,
-        [data-testid="stAppViewContainer"] [data-testid="stMarkdownContainer"] {
-            color: #202938;
-        }
-        [data-testid="stAppViewContainer"] [data-testid="stCaptionContainer"] p {
-            color: #586477;
-        }
-        [data-testid="stAppViewContainer"] input,
-        [data-testid="stAppViewContainer"] textarea {
-            color: #202938;
-            background-color: #ffffff;
-        }
-        [data-testid="stAppViewContainer"] [data-testid="stAlert"] p {
-            color: inherit;
-        }
-        """
+    """ if hero else ""
 
     st.markdown(
         f"""
         <style>
+        .stApp,
         [data-testid="stAppViewContainer"] {{
-            background: {background};
+            background: {background} !important;
+        }}
+        [data-testid="stSidebar"] {{
+            background: rgba(9, 14, 24, 0.94) !important;
+        }}
+        [data-testid="stSidebar"] p,
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] span,
+        [data-testid="stSidebar"] h1,
+        [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3 {{
+            color: #e7edf6;
+        }}
+        [data-testid="stMain"],
+        [data-testid="stMainBlockContainer"],
+        [data-testid="stBottom"],
+        .block-container {{
+            background: transparent !important;
+            background-color: transparent !important;
+        }}
+        [data-testid="stHeader"] {{
+            background: rgba(8, 14, 26, 0.28) !important;
+            backdrop-filter: blur(8px);
+        }}
+        [data-testid="stMain"] h1,
+        [data-testid="stMain"] h2,
+        [data-testid="stMain"] h3,
+        [data-testid="stMain"] p,
+        [data-testid="stMain"] label,
+        [data-testid="stMain"] li,
+        [data-testid="stCaptionContainer"] p {{
+            color: #f4efe6;
+        }}
+        [data-testid="stForm"],
+        [data-testid="stExpander"],
+        [data-testid="stDataFrame"],
+        .st-key-best_pick {{
+            background: rgba(255, 252, 247, 0.94) !important;
+            color: #1c2430;
+            border: 1px solid rgba(198, 161, 91, 0.38);
+            border-radius: 14px;
+        }}
+        .st-key-best_pick {{
+            border-top: 4px solid #c6a15b;
+            padding: 0.35rem 0.85rem 0.15rem;
+        }}
+        [data-testid="stForm"] p,
+        [data-testid="stForm"] label,
+        [data-testid="stForm"] span,
+        [data-testid="stForm"] h1,
+        [data-testid="stForm"] h2,
+        [data-testid="stForm"] h3,
+        [data-testid="stExpander"] p,
+        [data-testid="stExpander"] label,
+        [data-testid="stExpander"] span,
+        [data-testid="stExpander"] summary,
+        .st-key-best_pick p,
+        .st-key-best_pick label,
+        .st-key-best_pick span,
+        .st-key-best_pick li,
+        .st-key-best_pick h1,
+        .st-key-best_pick h2,
+        .st-key-best_pick h3,
+        [data-testid="stForm"] [data-testid="stCaptionContainer"] p,
+        [data-testid="stExpander"] [data-testid="stCaptionContainer"] p,
+        .st-key-best_pick [data-testid="stCaptionContainer"] p,
+        [data-testid="stAlert"],
+        [data-testid="stAlert"] p {{
+            color: #1c2430;
+        }}
+        [data-testid="stBaseButton-primary"] span,
+        [data-testid="stBaseButton-primary"] p {{
+            color: #1c1508;
+        }}
+        [data-testid="stMain"] input,
+        [data-testid="stMain"] textarea {{
+            color: #1c2430;
+            background-color: #ffffff;
         }}
         .block-container {{
             padding-top: {"2.2rem" if hero else "1.4rem"};
