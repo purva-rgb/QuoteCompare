@@ -202,6 +202,35 @@ def _apply_theme(hero: bool) -> None:
     }
     """
 
+    # Explicitly set readable foreground colors on the light results page.
+    # Some browser/Streamlit themes otherwise inherit near-white text on white.
+    if not hero:
+        hero_text += """
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] p,
+        [data-testid="stAppViewContainer"] label,
+        [data-testid="stAppViewContainer"] span,
+        [data-testid="stAppViewContainer"] h1,
+        [data-testid="stAppViewContainer"] h2,
+        [data-testid="stAppViewContainer"] h3,
+        [data-testid="stAppViewContainer"] h4,
+        [data-testid="stAppViewContainer"] li,
+        [data-testid="stAppViewContainer"] [data-testid="stMarkdownContainer"] {
+            color: #202938;
+        }
+        [data-testid="stAppViewContainer"] [data-testid="stCaptionContainer"] p {
+            color: #586477;
+        }
+        [data-testid="stAppViewContainer"] input,
+        [data-testid="stAppViewContainer"] textarea {
+            color: #202938;
+            background-color: #ffffff;
+        }
+        [data-testid="stAppViewContainer"] [data-testid="stAlert"] p {
+            color: inherit;
+        }
+        """
+
     st.markdown(
         f"""
         <style>
@@ -1385,30 +1414,25 @@ def _optional_number(value: Any) -> int | float | None:
 
 
 def render_supplier_ratings(results: list[dict[str, Any]]) -> None:
-    """Enter a public rating and review count. Does not score suppliers."""
+    """Enter public supplier ratings with safe blank-field handling."""
     refs = _supplier_refs(results)
     if not refs:
         return
 
     st.subheader("Supplier ratings")
     st.caption(
-        "Type a public rating and a review count for each quotation. "
-        "A blank field stays blank and is not stored as zero. The public "
-        "rating is the quality input. The review count is shown beside "
-        "it and is not added into the score."
+        "Enter a public rating from 1 to 5 and the number of reviews. "
+        "Leave either field blank if the information is unavailable. "
+        "Review count is displayed but does not affect the score."
     )
-
-    store: dict[str, Any] = st.session_state.setdefault(
-        SUPPLIER_RATINGS_KEY, {}
-    )
+    store: dict[str, Any] = st.session_state.setdefault(SUPPLIER_RATINGS_KEY, {})
 
     for ref in refs:
         key = supplier_key(ref)
         saved = _saved_rating(store, key)
-        where = (
-            f"Page {ref.page}" if ref.page is not None else "Whole PDF"
-        )
+        where = f"Page {ref.page}" if ref.page is not None else "Whole PDF"
 
+        # Text inputs support blank values consistently across Streamlit versions.
         with st.form(f"supplier_rating_{key}"):
             st.markdown(f"**{ref.supplier_name or 'Unnamed supplier'}**")
             st.caption(
@@ -1416,54 +1440,52 @@ def render_supplier_ratings(results: list[dict[str, Any]]) -> None:
                 f"Quotation no.: {ref.quotation_number or 'Unknown'}"
             )
             public_col, count_col = st.columns(2)
-            public_rating = public_col.number_input(
+            saved_public = saved.get("public_rating")
+            saved_count = saved.get("review_count")
+            public_text = public_col.text_input(
                 "Public rating (1–5)",
-                min_value=1.0,
-                max_value=5.0,
-                value=_optional_number(saved.get("public_rating")),
-                step=0.1,
-                format="%.1f",
+                value="" if saved_public is None else str(saved_public),
                 key=f"public_{key}",
+                placeholder="e.g. 4.5",
             )
-            review_count = count_col.number_input(
+            count_text = count_col.text_input(
                 "Review count",
-                min_value=0,
-                value=_optional_number(saved.get("review_count")),
-                step=1,
+                value="" if saved_count is None else str(saved_count),
                 key=f"reviews_{key}",
+                placeholder="e.g. 120",
             )
-            submitted = st.form_submit_button("Save ratings")
+            submitted = st.form_submit_button("Save Rating", type="primary")
 
         if saved:
             public = saved.get("public_rating")
             reviews = saved.get("review_count")
             st.caption(
-                "Saved. Public rating: "
-                f"{'Not entered' if public is None else public}. "
-                "Review count: "
+                "Previously saved — Public rating: "
+                f"{'Not entered' if public is None else public}; review count: "
                 f"{'Not entered' if reviews is None else reviews}."
             )
 
         if not submitted:
             continue
 
+        raw_public: Any = public_text.strip() or None
+        raw_count: Any = count_text.strip() or None
         try:
             record = validate_supplier_rating(
-                ref,
-                public_rating=public_rating,
-                review_count=review_count,
+                ref, public_rating=raw_public, review_count=raw_count
             )
         except RatingInputError as exc:
             for message in exc.errors:
                 st.error(message)
             continue
+        except Exception:
+            logger.exception("Unexpected error while saving supplier rating")
+            st.error("The rating could not be saved. Check the values and try again.")
+            continue
 
         store[key] = record.to_dict()
-        st.success(
-            "Saved ratings for "
-            f"{ref.supplier_name or 'this quotation'}."
-        )
-
+        st.session_state[SUPPLIER_RATINGS_KEY] = store
+        st.success(f"Rating saved for {ref.supplier_name or 'this quotation' }.")
 
 def _supplier_label(
     name: str,
